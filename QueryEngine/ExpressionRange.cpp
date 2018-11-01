@@ -161,10 +161,22 @@ ExpressionRange apply_simple_quals(
                     qual_bin_oper->get_optype(),
                     qual_range);
     } else {
-      apply_int_qual(qual_const->get_constval(),
-                     qual_const->get_type_info().get_type(),
-                     qual_bin_oper->get_optype(),
-                     qual_range);
+      const auto qual_col_ti = qual_col->get_type_info();
+      const auto qual_const_ti = qual_const->get_type_info();
+      auto const_d = qual_const->get_constval();
+      if (qual_col_ti.is_timestamp() && qual_const_ti.is_timestamp() &&
+          qual_col_ti != qual_const_ti) {
+        // For high precision timestamps, account for scale difference before applying
+        // qual
+        const auto result =
+            timestamp_precisions_lookup_.find(qual_col_ti.get_dimension());
+        const_d.timeval = DateTruncateAlterPrecision(result->second,
+                                                     const_d.timeval,
+                                                     qual_const_ti.get_dimension(),
+                                                     qual_col_ti.get_dimension());
+      }
+      apply_int_qual(
+          const_d, qual_const_ti.get_type(), qual_bin_oper->get_optype(), qual_range);
     }
   }
   if (qual_range.getType() == ExpressionRangeType::Integer) {
@@ -598,8 +610,7 @@ ExpressionRange getExpressionRange(
   const int rte_idx = col_expr->get_rte_idx();
   CHECK_GE(rte_idx, 0);
   CHECK_LT(static_cast<size_t>(rte_idx), query_infos.size());
-  bool is_outer_join_proj =
-      rte_idx > 0 && (executor->isOuterJoin() || executor->containsLeftDeepOuterJoin());
+  bool is_outer_join_proj = rte_idx > 0 && executor->containsLeftDeepOuterJoin();
   if (col_expr->get_table_id() > 0) {
     auto col_range = executor->getColRange(
         PhysicalInput{col_expr->get_column_id(), col_expr->get_table_id()});

@@ -618,7 +618,7 @@ void TypedImportBuffer::add_value(const ColumnDescriptor* cd,
       addGeoString(val);
       break;
     default:
-      CHECK(false);
+      CHECK(false) << "TypedImportBuffer::add_value() does not support type " << type;
   }
 }
 
@@ -629,6 +629,9 @@ void TypedImportBuffer::pop_value() {
   switch (type) {
     case kBOOLEAN:
       bool_buffer_->pop_back();
+      break;
+    case kTINYINT:
+      tinyint_buffer_->pop_back();
       break;
     case kSMALLINT:
       smallint_buffer_->pop_back();
@@ -669,7 +672,7 @@ void TypedImportBuffer::pop_value() {
       geo_string_buffer_->pop_back();
       break;
     default:
-      CHECK(false);
+      CHECK(false) << "TypedImportBuffer::pop_value() does not support type " << type;
   }
 }
 
@@ -922,6 +925,10 @@ size_t TypedImportBuffer::add_arrow_values(const ColumnDescriptor* cd,
     case kBOOLEAN:
       append_arrow_boolean(cd, col, bool_buffer_);
       break;
+    case kTINYINT:
+      ARROW_THROW_IF(col.type_id() != arrow::Type::INT8, "Expected int8 type");
+      append_arrow_integer<arrow::Int8Type, int8_t>(cd, col, tinyint_buffer_);
+      break;
     case kSMALLINT:
       ARROW_THROW_IF(col.type_id() != arrow::Type::INT16, "Expected int16 type");
       append_arrow_integer<arrow::Int16Type, int16_t>(cd, col, smallint_buffer_);
@@ -982,6 +989,18 @@ size_t TypedImportBuffer::add_values(const ColumnDescriptor* cd, const TColumn& 
           bool_buffer_->push_back(inline_fixed_encoding_null_val(cd->columnType));
         } else {
           bool_buffer_->push_back((int8_t)col.data.int_col[i]);
+        }
+      }
+      break;
+    }
+    case kTINYINT: {
+      dataSize = col.data.int_col.size();
+      tinyint_buffer_->reserve(dataSize);
+      for (size_t i = 0; i < dataSize; i++) {
+        if (col.nulls[i]) {
+          tinyint_buffer_->push_back(inline_fixed_encoding_null_val(cd->columnType));
+        } else {
+          tinyint_buffer_->push_back((int8_t)col.data.int_col[i]);
         }
       }
       break;
@@ -1103,6 +1122,24 @@ size_t TypedImportBuffer::add_values(const ColumnDescriptor* cd, const TColumn& 
                 for (size_t j = 0; j < len; ++j) {
                   *(bool*)p = static_cast<bool>(col.data.arr_col[i].data.int_col[j]);
                   p += sizeof(bool);
+                }
+                addArray(ArrayDatum(byteSize, buf, len == 0));
+              }
+            }
+            break;
+          }
+          case kTINYINT: {
+            for (size_t i = 0; i < dataSize; i++) {
+              if (col.nulls[i]) {
+                addArray(ArrayDatum(0, NULL, true));
+              } else {
+                size_t len = col.data.arr_col[i].data.int_col.size();
+                size_t byteSize = len * sizeof(int8_t);
+                int8_t* buf = (int8_t*)checked_malloc(len * byteSize);
+                int8_t* p = buf;
+                for (size_t j = 0; j < len; ++j) {
+                  *(int8_t*)p = static_cast<int8_t>(col.data.arr_col[i].data.int_col[j]);
+                  p += sizeof(int8_t);
                 }
                 addArray(ArrayDatum(byteSize, buf, len == 0));
               }
@@ -1370,7 +1407,7 @@ void TypedImportBuffer::add_value(const ColumnDescriptor* cd,
       }
       break;
     default:
-      CHECK(false);
+      CHECK(false) << "TypedImportBuffer::add_value() does not support type " << type;
   }
 }
 
@@ -1544,7 +1581,8 @@ static ImportStatus import_thread_delimited(
     size_t begin_pos,
     size_t end_pos,
     size_t total_size,
-    const ColumnIdToRenderGroupAnalyzerMapType& columnIdToRenderGroupAnalyzerMap) {
+    const ColumnIdToRenderGroupAnalyzerMapType& columnIdToRenderGroupAnalyzerMap,
+    size_t first_row_index_this_buffer) {
   ImportStatus import_status;
   int64_t total_get_row_time_us = 0;
   int64_t total_str_to_val_time_us = 0;
@@ -1565,6 +1603,7 @@ static ImportStatus import_thread_delimited(
       p->clear();
     }
     std::vector<std::string> row;
+    size_t row_index_plus_one = 0;
     for (const char* p = thread_buf; p < thread_buf_end; p++) {
       row.clear();
       if (DEBUG_TIMING) {
@@ -1589,6 +1628,7 @@ static ImportStatus import_thread_delimited(
                     row,
                     try_single_thread);
       }
+      row_index_plus_one++;
       int phys_cols = 0;
       int point_cols = 0;
       for (const auto cd : col_descs) {
@@ -1691,8 +1731,11 @@ static ImportStatus import_thread_delimited(
                         ring_sizes,
                         poly_rings,
                         PROMOTE_POLYGON_TO_MULTIPOLYGON)) {
-                  throw std::runtime_error("Cannot read geometry to insert into column " +
-                                           cd->columnName);
+                  std::string msg =
+                      "Failed to extract valid geometry from row " +
+                      std::to_string(first_row_index_this_buffer + row_index_plus_one) +
+                      " for column " + cd->columnName;
+                  throw std::runtime_error(msg);
                 }
 
                 // validate types
@@ -1743,8 +1786,7 @@ static ImportStatus import_thread_delimited(
           }
           import_status.rows_rejected++;
           LOG(ERROR) << "Input exception thrown: " << e.what()
-                     << ". Row discarded, issue at column : " << (col_idx + 1)
-                     << " data :" << row;
+                     << ". Row discarded. Data: " << row;
         }
       });
       total_str_to_val_time_us += us;
@@ -1774,6 +1816,7 @@ static ImportStatus import_thread_shapefile(
     Importer* importer,
     OGRSpatialReference* poGeographicSR,
     const FeaturePtrVector& features,
+    size_t firstFeature,
     size_t numFeatures,
     const FieldNameToIndexMapType& fieldNameToIndexMap,
     const ColumnNameToSourceNameMapType& columnNameToSourceNameMap,
@@ -1821,9 +1864,12 @@ static ImportStatus import_thread_shapefile(
 
         // is this a geo column?
         const auto& col_ti = cd->columnType;
-        if (cd->columnName == MAPD_GEO_PREFIX && col_ti.get_physical_cols() > 0) {
+        if (col_ti.is_geometry()) {
+          // Note that this assumes there is one and only one geo column in the table.
+          // Currently, the importer only supports reading a single geospatial feature
+          // from an input shapefile / geojson file, but this code will need to be
+          // modified if that changes
           SQLTypes col_type = col_ti.get_type();
-          CHECK(IS_GEO(col_type));
 
           // store null string in the base column
           import_buffers[col_idx]->add_value(cd, copy_params.null_str, true, copy_params);
@@ -1847,8 +1893,10 @@ static ImportStatus import_thread_shapefile(
                   ring_sizes,
                   poly_rings,
                   PROMOTE_POLYGON_TO_MULTIPOLYGON)) {
-            throw std::runtime_error("Cannot read geometry to insert into column " +
-                                     cd->columnName);
+            std::string msg = "Failed to extract valid geometry from feature " +
+                              std::to_string(firstFeature + iFeature + 1) +
+                              " for column " + cd->columnName;
+            throw std::runtime_error(msg);
           }
 
           // validate types
@@ -1972,8 +2020,7 @@ static ImportStatus import_thread_shapefile(
         import_buffers[col_idx_to_pop]->pop_value();
       }
       import_status.rows_rejected++;
-      LOG(ERROR) << "Input exception thrown: " << e.what()
-                 << ". Row discarded, issue at column : " << (col_idx + 1);
+      LOG(ERROR) << "Input exception thrown: " << e.what() << ". Row discarded.";
     }
   }
   float convert_ms =
@@ -2900,6 +2947,7 @@ void DataStreamSink::import_compressed(std::vector<std::string>& file_paths) {
         // start reading uncompressed bytes of this archive from libarchive
         // note! this archive may contain more than one files!
         while (!stop && !!(just_saw_archive_header = arch.read_next_header())) {
+          bool insert_line_delim_after_this_file = false;
           while (!stop && arch.read_data_block(&buf, &size, &offset)) {
             // one subtle point here is now we concatenate all files
             // to a single FILE stream with which we call importDelimited
@@ -2928,24 +2976,65 @@ void DataStreamSink::import_compressed(std::vector<std::string>& file_paths) {
             // loop reading till no bytes left, otherwise the annoying `failed to write
             // pipe: Success`...
             if (size2 > 0) {
-              for (int nread = 0, nleft = size2; nleft > 0;
-                   nleft -= (nread > 0 ? nread : 0)) {
-                nread = write(fd[1], buf2, nleft);
-                if (nread == nleft) {
-                  break;  // done
+              int nremaining = size2;
+              while (nremaining > 0) {
+                // try to write the entire remainder of the buffer to the pipe
+                int nwritten = write(fd[1], buf2, nremaining);
+                // how did we do?
+                if (nwritten < 0) {
+                  // something bad happened
+                  if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // ignore these, assume nothing written, try again
+                    nwritten = 0;
+                  } else {
+                    // a real error
+                    throw std::runtime_error(
+                        std::string("failed or interrupted write to pipe: ") +
+                        strerror(errno));
+                  }
+                } else if (nwritten == nremaining) {
+                  // we wrote everything; we're done
+                  break;
                 }
+                // only wrote some (or nothing), try again
+                nremaining -= nwritten;
+                buf2 += nwritten;
                 // no exception when too many rejected
+                // @simon.eves how would this get set? from the other thread? mutex
+                // needed?
                 if (import_status.load_truncated) {
                   stop = true;
                   break;
                 }
-                // not to overwrite original error
-                if (nread < 0 &&
-                    !(errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+              }
+              // check that this file (buf for size) ended with a line delim
+              if (size > 0) {
+                const char* plast = static_cast<const char*>(buf) + (size - 1);
+                insert_line_delim_after_this_file = (*plast != copy_params.line_delim);
+              }
+            }
+          }
+          // if that file didn't end with a line delim, we insert one here to terminate
+          // that file's stream use a loop for the same reason as above
+          if (insert_line_delim_after_this_file) {
+            while (true) {
+              // write the delim char to the pipe
+              int nwritten = write(fd[1], &copy_params.line_delim, 1);
+              // how did we do?
+              if (nwritten < 0) {
+                // something bad happened
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                  // ignore these, assume nothing written, try again
+                  nwritten = 0;
+                } else {
+                  // a real error
                   throw std::runtime_error(
                       std::string("failed or interrupted write to pipe: ") +
                       strerror(errno));
                 }
+              } else if (nwritten == 1) {
+                // we wrote it; we're done
+                break;
               }
             }
           }
@@ -3020,7 +3109,7 @@ ImportStatus Importer::importDelimited(const std::string& file_path,
   }
 
   for (size_t i = 0; i < max_threads; i++) {
-    import_buffers_vec.push_back(std::vector<std::unique_ptr<TypedImportBuffer>>());
+    import_buffers_vec.emplace_back();
     for (const auto cd : loader->get_column_descs()) {
       import_buffers_vec[i].push_back(std::unique_ptr<TypedImportBuffer>(
           new TypedImportBuffer(cd, loader->get_string_dict(cd))));
@@ -3061,6 +3150,8 @@ ImportStatus Importer::importDelimited(const std::string& file_path,
       stack_thread_ids.push(i);
     }
 
+    size_t first_row_index_this_buffer = 0;
+
     auto start_epoch = loader->getTableEpoch();
     while (size > 0) {
       if (eof_reached) {
@@ -3073,6 +3164,23 @@ ImportStatus Importer::importDelimited(const std::string& file_path,
       std::unique_ptr<char> unbuf(nresidual > 0 ? new char[nresidual] : nullptr);
       if (unbuf) {
         memcpy(unbuf.get(), sbuffer.get() + end_pos, nresidual);
+      }
+
+      // added for true row index on error
+      unsigned int num_rows_this_buffer = 0;
+      {
+        // we could multi-thread this, but not worth it
+        // additional cost here is ~1.4ms per chunk and
+        // probably free because this thread will spend
+        // most of its time waiting for the child threads
+        char* p = sbuffer.get() + begin_pos;
+        char* pend = sbuffer.get() + end_pos;
+        char d = copy_params.line_delim;
+        while (p < pend) {
+          if (*p++ == d) {
+            num_rows_this_buffer++;
+          }
+        }
       }
 
       // get a thread_id not in use
@@ -3088,7 +3196,10 @@ ImportStatus Importer::importDelimited(const std::string& file_path,
                                    begin_pos,
                                    end_pos,
                                    end_pos,
-                                   columnIdToRenderGroupAnalyzerMap));
+                                   columnIdToRenderGroupAnalyzerMap,
+                                   first_row_index_this_buffer));
+
+      first_row_index_this_buffer += num_rows_this_buffer;
 
       current_pos += end_pos;
       sbuffer.reset(new char[alloc_size]);
@@ -3820,6 +3931,7 @@ ImportStatus Importer::importGDAL(
                                                      this,
                                                      poGeographicSR.get(),
                                                      std::move(features[thread_id]),
+                                                     firstFeatureThisChunk,
                                                      numFeaturesThisChunk,
                                                      fieldNameToIndexMap,
                                                      columnNameToSourceNameMap,
@@ -3836,6 +3948,7 @@ ImportStatus Importer::importGDAL(
                                  this,
                                  poGeographicSR.get(),
                                  std::move(features[thread_id]),
+                                 firstFeatureThisChunk,
                                  numFeaturesThisChunk,
                                  fieldNameToIndexMap,
                                  columnNameToSourceNameMap,
@@ -4060,9 +4173,9 @@ void RenderGroupAnalyzer::seedFromExistingTableContents(
   auto bulk_load_timer = timer_start();
   _rtree = std::make_unique<RTree>(nodes);
   CHECK(_rtree);
-  LOG(INFO) << "Scanning existing poly render groups of table '" << tableName << "' took "
-            << timer_stop(seedTimer) << "ms (" << timer_stop(bulk_load_timer)
-            << " ms for tree)";
+  LOG(INFO) << "Scanning render groups of poly column '" << geoColumnBaseName
+            << "' of table '" << tableName << "' took " << timer_stop(seedTimer) << "ms ("
+            << timer_stop(bulk_load_timer) << " ms for tree)";
 
   if (DEBUG_RENDER_GROUP_ANALYZER) {
     LOG(INFO) << "DEBUG: Done! Now have " << _numRenderGroups << " Render Groups";
@@ -4119,7 +4232,7 @@ void ImportDriver::import_geo_table(const std::string& file_path,
                                     const std::string& table_name,
                                     const bool compression,
                                     const bool create_table) {
-  const std::string geo_column_name(MAPD_GEO_PREFIX);
+  const std::string geo_column_name(OMNISCI_GEO_PREFIX);
 
   CopyParams copy_params;
   if (compression) {

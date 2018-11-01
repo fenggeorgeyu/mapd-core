@@ -30,7 +30,6 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <boost/make_unique.hpp>
 
 #include <algorithm>
 #include <queue>
@@ -468,9 +467,8 @@ void fill_storage_buffer(int8_t* buff,
                          const QueryMemoryDescriptor& query_mem_desc,
                          NumberGenerator& generator,
                          const size_t step) {
-  switch (query_mem_desc.getGroupByColRangeType()) {
-    case GroupByColRangeType::OneColKnownRange:
-    case GroupByColRangeType::MultiColPerfectHash: {
+  switch (query_mem_desc.getQueryDescriptionType()) {
+    case QueryDescriptionType::GroupByPerfectHash: {
       if (query_mem_desc.didOutputColumnar()) {
         fill_storage_buffer_perfect_hash_colwise(
             buff, target_infos, query_mem_desc, generator);
@@ -480,7 +478,7 @@ void fill_storage_buffer(int8_t* buff,
       }
       break;
     }
-    case GroupByColRangeType::MultiCol: {
+    case QueryDescriptionType::GroupByBaselineHash: {
       if (query_mem_desc.didOutputColumnar()) {
         fill_storage_buffer_baseline_colwise(
             buff, target_infos, query_mem_desc, generator, step);
@@ -503,7 +501,7 @@ QueryMemoryDescriptor perfect_hash_one_col_desc_small(
     const std::vector<TargetInfo>& target_infos,
     const int8_t num_bytes) {
   QueryMemoryDescriptor query_mem_desc(
-      GroupByColRangeType::OneColKnownRange, 0, 19, false, {8});
+      QueryDescriptionType::GroupByPerfectHash, 0, 19, false, {8});
   for (const auto& target_info : target_infos) {
     const auto slot_bytes =
         std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
@@ -524,7 +522,7 @@ QueryMemoryDescriptor perfect_hash_one_col_desc(
     const size_t min_val,
     const size_t max_val) {
   QueryMemoryDescriptor query_mem_desc(
-      GroupByColRangeType::OneColKnownRange, min_val, max_val, false, {8});
+      QueryDescriptionType::GroupByPerfectHash, min_val, max_val, false, {8});
   for (const auto& target_info : target_infos) {
     const auto slot_bytes =
         std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
@@ -533,6 +531,9 @@ QueryMemoryDescriptor perfect_hash_one_col_desc(
       query_mem_desc.addAggColWidth(ColWidths{slot_bytes, slot_bytes});
     }
     query_mem_desc.addAggColWidth(ColWidths{slot_bytes, slot_bytes});
+    if (target_info.sql_type.is_varlen()) {
+      query_mem_desc.addAggColWidth(ColWidths{slot_bytes, slot_bytes});
+    }
   }
   query_mem_desc.setEntryCount(query_mem_desc.getMaxVal() - query_mem_desc.getMinVal() +
                                1);
@@ -543,7 +544,7 @@ QueryMemoryDescriptor perfect_hash_two_col_desc(
     const std::vector<TargetInfo>& target_infos,
     const int8_t num_bytes) {
   QueryMemoryDescriptor query_mem_desc(
-      GroupByColRangeType::MultiColPerfectHash, 0, 36, false, {8, 8});
+      QueryDescriptionType::GroupByPerfectHash, 0, 36, false, {8, 8});
   for (const auto& target_info : target_infos) {
     const auto slot_bytes =
         std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
@@ -561,7 +562,7 @@ QueryMemoryDescriptor baseline_hash_two_col_desc_large(
     const std::vector<TargetInfo>& target_infos,
     const int8_t num_bytes) {
   QueryMemoryDescriptor query_mem_desc(
-      GroupByColRangeType::MultiCol, 0, 19, false, {8, 8});
+      QueryDescriptionType::GroupByBaselineHash, 0, 19, false, {8, 8});
   for (const auto& target_info : target_infos) {
     const auto slot_bytes =
         std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
@@ -580,7 +581,7 @@ QueryMemoryDescriptor baseline_hash_two_col_desc(
     const std::vector<TargetInfo>& target_infos,
     const int8_t num_bytes) {
   QueryMemoryDescriptor query_mem_desc(
-      GroupByColRangeType::MultiCol, 0, 3, false, {8, 8});
+      QueryDescriptionType::GroupByBaselineHash, 0, 3, false, {8, 8});
   for (const auto& target_info : target_infos) {
     const auto slot_bytes =
         std::max(num_bytes, static_cast<int8_t>(target_info.sql_type.get_size()));
@@ -1122,9 +1123,8 @@ void ResultSetEmulator::rse_fill_storage_buffer(int8_t* buff,
                                                 NumberGenerator& generator,
                                                 const std::vector<bool>& rs_groups,
                                                 std::vector<int64_t>& rs_values) {
-  switch (rs_query_mem_desc.getGroupByColRangeType()) {
-    case GroupByColRangeType::OneColKnownRange:
-    case GroupByColRangeType::MultiColPerfectHash: {
+  switch (rs_query_mem_desc.getQueryDescriptionType()) {
+    case QueryDescriptionType::GroupByPerfectHash: {
       if (rs_query_mem_desc.didOutputColumnar()) {
         rse_fill_storage_buffer_perfect_hash_colwise(
             buff, generator, rs_groups, rs_values);
@@ -1134,7 +1134,7 @@ void ResultSetEmulator::rse_fill_storage_buffer(int8_t* buff,
       }
       break;
     }
-    case GroupByColRangeType::MultiCol: {
+    case QueryDescriptionType::GroupByBaselineHash: {
       if (rs_query_mem_desc.didOutputColumnar()) {
         rse_fill_storage_buffer_baseline_colwise(buff, generator, rs_groups, rs_values);
       } else {
@@ -1537,12 +1537,12 @@ void test_reduce(const std::vector<TargetInfo>& target_infos,
   const ResultSetStorage* storage2{nullptr};
   const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
   row_set_mem_owner->addStringDict(g_sd, 1, g_sd->storageEntryCount());
-  const auto rs1 = boost::make_unique<ResultSet>(
+  const auto rs1 = std::make_unique<ResultSet>(
       target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
   storage1 = rs1->allocateStorage();
   fill_storage_buffer(
       storage1->getUnderlyingBuffer(), target_infos, query_mem_desc, generator1, step);
-  const auto rs2 = boost::make_unique<ResultSet>(
+  const auto rs2 = std::make_unique<ResultSet>(
       target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
   storage2 = rs2->allocateStorage();
   fill_storage_buffer(
@@ -1607,9 +1607,8 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
   std::unique_ptr<ResultSet> rs1;
   std::unique_ptr<ResultSet> rs2;
   const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
-  switch (query_mem_desc.getGroupByColRangeType()) {
-    case GroupByColRangeType::OneColKnownRange:
-    case GroupByColRangeType::MultiColPerfectHash: {
+  switch (query_mem_desc.getQueryDescriptionType()) {
+    case QueryDescriptionType::GroupByPerfectHash: {
       rs1.reset(new ResultSet(target_infos,
                               ExecutorDeviceType::CPU,
                               query_mem_desc,
@@ -1624,7 +1623,7 @@ void test_reduce_random_groups(const std::vector<TargetInfo>& target_infos,
       storage2 = rs2->allocateStorage();
       break;
     }
-    case GroupByColRangeType::MultiCol: {
+    case QueryDescriptionType::GroupByBaselineHash: {
       rs1.reset(new ResultSet(target_infos,
                               ExecutorDeviceType::CPU,
                               query_mem_desc,
@@ -2179,10 +2178,10 @@ TEST(MoreReduce, MissingValues) {
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(false);
   const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
-  const auto rs1 = boost::make_unique<ResultSet>(
+  const auto rs1 = std::make_unique<ResultSet>(
       target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
   const auto storage1 = rs1->allocateStorage();
-  const auto rs2 = boost::make_unique<ResultSet>(
+  const auto rs2 = std::make_unique<ResultSet>(
       target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
   const auto storage2 = rs2->allocateStorage();
   {
@@ -2209,7 +2208,7 @@ TEST(MoreReduce, MissingValues) {
     buff2[1 * 3 + 2] = 0;
     buff2[2 * 3 + 2] = 5;
   }
-  storage1->reduce(*storage2);
+  storage1->reduce(*storage2, {});
   {
     const auto row = rs1->getNextRow(false, false);
     CHECK_EQ(size_t(2), row.size());
@@ -2237,10 +2236,10 @@ TEST(MoreReduce, MissingValuesKeyless) {
   auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
   query_mem_desc.setHasKeylessHash(true);
   const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
-  const auto rs1 = boost::make_unique<ResultSet>(
+  const auto rs1 = std::make_unique<ResultSet>(
       target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
   const auto storage1 = rs1->allocateStorage();
-  const auto rs2 = boost::make_unique<ResultSet>(
+  const auto rs2 = std::make_unique<ResultSet>(
       target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
   const auto storage2 = rs2->allocateStorage();
   {
@@ -2261,7 +2260,7 @@ TEST(MoreReduce, MissingValuesKeyless) {
     buff2[1 * 2 + 1] = 0;
     buff2[2 * 2 + 1] = 5;
   }
-  storage1->reduce(*storage2);
+  storage1->reduce(*storage2, {});
   {
     const auto row = rs1->getNextRow(false, false);
     CHECK_EQ(size_t(2), row.size());
@@ -2273,6 +2272,82 @@ TEST(MoreReduce, MissingValuesKeyless) {
     CHECK_EQ(size_t(2), row.size());
     ASSERT_EQ(9, v<int64_t>(row[0]));
     ASSERT_EQ(5, v<int64_t>(row[1]));
+  }
+  {
+    const auto row = rs1->getNextRow(false, false);
+    ASSERT_EQ(size_t(0), row.size());
+  }
+}
+
+TEST(MoreReduce, OffsetRewrite) {
+  std::vector<TargetInfo> target_infos;
+  SQLTypeInfo bigint_ti(kBIGINT, false);
+  SQLTypeInfo real_str_ti(kTEXT, true, kENCODING_NONE);
+  SQLTypeInfo null_ti(kNULLT, false);
+
+  target_infos.push_back(TargetInfo{false, kMIN, bigint_ti, null_ti, true, false});
+  target_infos.push_back(TargetInfo{true, kSAMPLE, real_str_ti, null_ti, true, false});
+  auto query_mem_desc = perfect_hash_one_col_desc(target_infos, 8, 7, 9);
+  query_mem_desc.setHasKeylessHash(false);
+  const auto row_set_mem_owner = std::make_shared<RowSetMemoryOwner>();
+  const auto rs1 = std::make_unique<ResultSet>(
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+  const auto storage1 = rs1->allocateStorage();
+  const auto rs2 = std::make_unique<ResultSet>(
+      target_infos, ExecutorDeviceType::CPU, query_mem_desc, row_set_mem_owner, nullptr);
+  const auto storage2 = rs2->allocateStorage();
+  std::vector<std::string> serialized_varlen_buffer{"foo", "bar", "hello"};
+
+  {
+    auto buff1 = reinterpret_cast<int64_t*>(storage1->getUnderlyingBuffer());
+    buff1[0 * 4] = 7;
+    buff1[1 * 4] = 8;
+    buff1[2 * 4] = 9;
+    buff1[0 * 4 + 1] = 7;
+    buff1[1 * 4 + 1] = 8;
+    buff1[2 * 4 + 1] = 9;
+    buff1[0 * 4 + 2] = 0;
+    buff1[1 * 4 + 2] = 0;
+    buff1[2 * 4 + 2] = 1;
+    buff1[0 * 4 + 3] = 0;
+    buff1[1 * 4 + 3] = 0;
+    buff1[2 * 4 + 3] = 0;
+  }
+  {
+    auto buff2 = reinterpret_cast<int64_t*>(storage2->getUnderlyingBuffer());
+    buff2[0 * 4] = 7;
+    buff2[1 * 4] = 8;
+    buff2[2 * 4] = 9;
+    buff2[0 * 4 + 1] = 7;
+    buff2[1 * 4 + 1] = 8;
+    buff2[2 * 4 + 1] = 9;
+    buff2[0 * 4 + 2] = 0;
+    buff2[1 * 4 + 2] = 2;
+    buff2[2 * 4 + 2] = 1;
+    buff2[0 * 4 + 3] = 0;
+    buff2[1 * 4 + 3] = 0;
+    buff2[2 * 4 + 3] = 0;
+  }
+
+  storage1->rewriteAggregateBufferOffsets(serialized_varlen_buffer);
+  storage1->reduce(*storage2, serialized_varlen_buffer);
+  {
+    const auto row = rs1->getNextRow(false, false);
+    CHECK_EQ(size_t(2), row.size());
+    ASSERT_EQ(7, v<int64_t>(row[0]));
+    ASSERT_EQ("foo", boost::get<std::string>(v<NullableString>(row[1])));
+  }
+  {
+    const auto row = rs1->getNextRow(false, false);
+    CHECK_EQ(size_t(2), row.size());
+    ASSERT_EQ(8, v<int64_t>(row[0]));
+    ASSERT_EQ("hello", boost::get<std::string>(v<NullableString>(row[1])));
+  }
+  {
+    const auto row = rs1->getNextRow(false, false);
+    CHECK_EQ(size_t(2), row.size());
+    ASSERT_EQ(9, v<int64_t>(row[0]));
+    ASSERT_EQ("bar", boost::get<std::string>(v<NullableString>(row[1])));
   }
   {
     const auto row = rs1->getNextRow(false, false);

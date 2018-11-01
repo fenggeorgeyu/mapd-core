@@ -141,36 +141,49 @@ struct Users {
 };
 struct Roles {
   void setup_roles() {
-    if (!sys_cat.getMetadataForRole("OldLady")) {
+    if (!sys_cat.getRoleGrantee("OldLady")) {
       sys_cat.createRole("OldLady", false);
-      CHECK(sys_cat.getMetadataForRole("OldLady"));
+      CHECK(sys_cat.getRoleGrantee("OldLady"));
     }
-    if (!sys_cat.getMetadataForRole("Gunners")) {
+    if (!sys_cat.getRoleGrantee("Gunners")) {
       sys_cat.createRole("Gunners", false);
-      CHECK(sys_cat.getMetadataForRole("Gunners"));
+      CHECK(sys_cat.getRoleGrantee("Gunners"));
     }
-    if (!sys_cat.getMetadataForRole("Sudens")) {
+    if (!sys_cat.getRoleGrantee("Sudens")) {
       sys_cat.createRole("Sudens", false);
-      CHECK(sys_cat.getMetadataForRole("Sudens"));
+      CHECK(sys_cat.getRoleGrantee("Sudens"));
     }
   }
 
   void drop_roles() {
-    if (sys_cat.getMetadataForRole("OldLady")) {
+    if (sys_cat.getRoleGrantee("OldLady")) {
       sys_cat.dropRole("OldLady");
-      CHECK(!sys_cat.getMetadataForRole("OldLady"));
+      CHECK(!sys_cat.getRoleGrantee("OldLady"));
     }
-    if (sys_cat.getMetadataForRole("Gunners")) {
+    if (sys_cat.getRoleGrantee("Gunners")) {
       sys_cat.dropRole("Gunners");
-      CHECK(!sys_cat.getMetadataForRole("Gunners"));
+      CHECK(!sys_cat.getRoleGrantee("Gunners"));
     }
-    if (sys_cat.getMetadataForRole("Sudens")) {
+    if (sys_cat.getRoleGrantee("Sudens")) {
       sys_cat.dropRole("Sudens");
-      CHECK(!sys_cat.getMetadataForRole("sudens"));
+      CHECK(!sys_cat.getRoleGrantee("sudens"));
     }
   }
   Roles() { setup_roles(); }
   virtual ~Roles() { drop_roles(); }
+};
+
+struct GrantSyntax : testing::Test {
+  Users user_;
+  Roles role_;
+
+  void setup_tables() { run_ddl_statement("CREATE TABLE IF NOT EXISTS tbl(i INTEGER)"); }
+  void drop_tables() { run_ddl_statement("DROP TABLE IF EXISTS tbl"); }
+  explicit GrantSyntax() {
+    drop_tables();
+    setup_tables();
+  }
+  virtual ~GrantSyntax() { drop_tables(); }
 };
 
 struct DatabaseObject : testing::Test {
@@ -278,6 +291,64 @@ struct DashboardObject : testing::Test {
   virtual ~DashboardObject() { drop_dashboards(); }
 };
 
+TEST_F(GrantSyntax, MultiPrivilegeGrantRevoke) {
+  auto& g_cat = g_session->get_catalog();
+  DBObject tbl_object("tbl", DBObjectType::TableDBObjectType);
+  tbl_object.loadKey(g_cat);
+  tbl_object.resetPrivileges();
+  auto tbl_object_select = tbl_object;
+  auto tbl_object_insert = tbl_object;
+  tbl_object_select.setPrivileges(AccessPrivileges::SELECT_FROM_TABLE);
+  tbl_object_insert.setPrivileges(AccessPrivileges::INSERT_INTO_TABLE);
+  std::vector<DBObject> objects = {tbl_object_select, tbl_object_insert};
+  ASSERT_NO_THROW(
+      sys_cat.grantDBObjectPrivilegesBatch({"Arsenal", "Juventus"}, objects, g_cat));
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", objects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", objects), true);
+  ASSERT_NO_THROW(
+      sys_cat.revokeDBObjectPrivilegesBatch({"Arsenal", "Juventus"}, objects, g_cat));
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", objects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", objects), false);
+
+  // now the same thing, but with SQL queries
+  ASSERT_NO_THROW(
+      run_ddl_statement("GRANT SELECT, INSERT ON TABLE tbl TO Arsenal, Juventus"));
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", objects), true);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", objects), true);
+  ASSERT_NO_THROW(
+      run_ddl_statement("REVOKE SELECT, INSERT ON TABLE tbl FROM Arsenal, Juventus"));
+  EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", objects), false);
+  EXPECT_EQ(sys_cat.checkPrivileges("Juventus", objects), false);
+}
+
+TEST_F(GrantSyntax, MultiRoleGrantRevoke) {
+  std::vector<std::string> roles = {"Gunners", "Sudens"};
+  std::vector<std::string> grantees = {"Juventus", "Bayern"};
+  auto check_grant = []() {
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Juventus", "Gunners", true), true);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Bayern", "Gunners", true), true);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Juventus", "Sudens", true), true);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Bayern", "Sudens", true), true);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Arsenal", "Sudens", true), false);
+  };
+  auto check_revoke = []() {
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Juventus", "Gunners", true), false);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Bayern", "Gunners", true), false);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Juventus", "Sudens", true), false);
+    EXPECT_EQ(sys_cat.isRoleGrantedToGrantee("Bayern", "Sudens", true), false);
+  };
+  ASSERT_NO_THROW(sys_cat.grantRoleBatch(roles, grantees));
+  check_grant();
+  ASSERT_NO_THROW(sys_cat.revokeRoleBatch(roles, grantees));
+  check_revoke();
+
+  // now the same thing, but with SQL queries
+  ASSERT_NO_THROW(run_ddl_statement("GRANT Gunners, Sudens TO Juventus, Bayern"));
+  check_grant();
+  ASSERT_NO_THROW(run_ddl_statement("REVOKE Gunners, Sudens FROM Juventus, Bayern"));
+  check_revoke();
+}
+
 TEST(UserRoles, InvalidGrantsRevokesTest) {
   run_ddl_statement("CREATE USER Antazin(password = 'password', is_super = 'false');");
   run_ddl_statement("CREATE USER Max(password = 'password', is_super = 'false');");
@@ -312,6 +383,75 @@ TEST(UserRoles, ValidNames) {
   EXPECT_NO_THROW(run_ddl_statement("DROP ROLE developer;"));
   EXPECT_NO_THROW(run_ddl_statement("DROP ROLE developer-backend;"));
   EXPECT_NO_THROW(run_ddl_statement("DROP ROLE developer-backend-rendering;"));
+}
+
+TEST(UserRoles, RoleHierarchies) {
+  // hr prefix here stands for hierarchical roles
+
+  // create objects
+  run_ddl_statement("CREATE USER hr_u1 (password = 'u1');");
+  run_ddl_statement("CREATE ROLE hr_r1;");
+  run_ddl_statement("CREATE ROLE hr_r2;");
+  run_ddl_statement("CREATE ROLE hr_r3;");
+  run_ddl_statement("CREATE ROLE hr_r4;");
+  run_ddl_statement("CREATE TABLE hr_tbl1 (i INTEGER);");
+
+  // check that we can't create cycles
+  EXPECT_NO_THROW(run_ddl_statement("GRANT hr_r4 TO hr_r3;"));
+  EXPECT_THROW(run_ddl_statement("GRANT hr_r3 TO hr_r4;"), std::runtime_error);
+  EXPECT_NO_THROW(run_ddl_statement("GRANT hr_r3 TO hr_r2;"));
+  EXPECT_THROW(run_ddl_statement("GRANT hr_r2 TO hr_r4;"), std::runtime_error);
+
+  // make the grant hierarchy
+  EXPECT_NO_THROW(run_ddl_statement("GRANT hr_r2 TO hr_r1;"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT hr_r1 TO hr_u1;"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT SELECT ON TABLE hr_tbl1 TO hr_r1;"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT INSERT ON TABLE hr_tbl1 TO hr_r2;"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT DELETE ON TABLE hr_tbl1 TO hr_r3;"));
+  EXPECT_NO_THROW(run_ddl_statement("GRANT UPDATE ON TABLE hr_tbl1 TO hr_r4;"));
+
+  // check that we see privileges gratnted via roles' hierarchy
+  auto& g_cat = g_session->get_catalog();
+  AccessPrivileges tbl_privs;
+  ASSERT_NO_THROW(tbl_privs.add(AccessPrivileges::SELECT_FROM_TABLE));
+  ASSERT_NO_THROW(tbl_privs.add(AccessPrivileges::INSERT_INTO_TABLE));
+  ASSERT_NO_THROW(tbl_privs.add(AccessPrivileges::DELETE_FROM_TABLE));
+  ASSERT_NO_THROW(tbl_privs.add(AccessPrivileges::UPDATE_IN_TABLE));
+  DBObject tbl1_object("hr_tbl1", DBObjectType::TableDBObjectType);
+  tbl1_object.loadKey(g_cat);
+  ASSERT_NO_THROW(tbl1_object.setPrivileges(tbl_privs));
+  privObjects.clear();
+  privObjects.push_back(tbl1_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("hr_u1", privObjects), true);
+  // check that when we remove privilege from one role, it's grantees are updated
+  EXPECT_NO_THROW(run_ddl_statement("REVOKE DELETE ON TABLE hr_tbl1 FROM hr_r3;"));
+  EXPECT_EQ(sys_cat.checkPrivileges("hr_u1", privObjects), false);
+  tbl_privs.remove(AccessPrivileges::DELETE_FROM_TABLE);
+  ASSERT_NO_THROW(tbl1_object.setPrivileges(tbl_privs));
+  privObjects.clear();
+  privObjects.push_back(tbl1_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("hr_u1", privObjects), true);
+  // check that if we remove a role from a middle of hierarchy everythings is fine
+  EXPECT_NO_THROW(run_ddl_statement("REVOKE hr_r2 FROM hr_r1;"));
+  EXPECT_EQ(sys_cat.checkPrivileges("hr_u1", privObjects), false);
+  tbl_privs.remove(AccessPrivileges::UPDATE_IN_TABLE);
+  ASSERT_NO_THROW(tbl1_object.setPrivileges(tbl_privs));
+  privObjects.clear();
+  privObjects.push_back(tbl1_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("hr_u1", privObjects), false);
+  tbl_privs.remove(AccessPrivileges::INSERT_INTO_TABLE);
+  ASSERT_NO_THROW(tbl1_object.setPrivileges(tbl_privs));
+  privObjects.clear();
+  privObjects.push_back(tbl1_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("hr_u1", privObjects), true);
+
+  // clean-up objects
+  run_ddl_statement("DROP USER hr_u1;");
+  run_ddl_statement("DROP ROLE hr_r1;");
+  run_ddl_statement("DROP ROLE hr_r2;");
+  run_ddl_statement("DROP ROLE hr_r3;");
+  run_ddl_statement("DROP ROLE hr_r4;");
+  run_ddl_statement("DROP TABLE hr_tbl1;");
 }
 
 TEST_F(DatabaseObject, AccessDefaultsTest) {
@@ -358,8 +498,8 @@ TEST_F(DatabaseObject, SqlEditorAccessTest) {
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::VIEW_SQL_EDITOR));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Chelsea", mapd_object, cat_mapd));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Juventus", mapd_object, cat_mapd));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivilegesBatch(
+      {"Chelsea", "Juventus"}, {mapd_object}, cat_mapd));
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::VIEW_SQL_EDITOR));
@@ -370,10 +510,10 @@ TEST_F(DatabaseObject, SqlEditorAccessTest) {
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::VIEW_SQL_EDITOR));
-  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Chelsea", mapd_object, cat_mapd));
-  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Juventus", mapd_object, cat_mapd));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Bayern", mapd_object, cat_mapd));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Arsenal", mapd_object, cat_mapd));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivilegesBatch(
+      {"Chelsea", "Juventus"}, {mapd_object}, cat_mapd));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivilegesBatch(
+      {"Bayern", "Arsenal"}, {mapd_object}, cat_mapd));
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::VIEW_SQL_EDITOR));
@@ -414,8 +554,8 @@ TEST_F(DatabaseObject, DBLoginAccessTest) {
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::ACCESS));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Arsenal", mapd_object, cat_mapd));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Bayern", mapd_object, cat_mapd));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivilegesBatch(
+      {"Arsenal", "Bayern"}, {mapd_object}, cat_mapd));
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::ACCESS));
@@ -426,8 +566,8 @@ TEST_F(DatabaseObject, DBLoginAccessTest) {
 
   mapd_object.resetPrivileges();
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::ACCESS));
-  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Bayern", mapd_object, cat_mapd));
-  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivileges("Arsenal", mapd_object, cat_mapd));
+  ASSERT_NO_THROW(sys_cat.revokeDBObjectPrivilegesBatch(
+      {"Bayern", "Arsenal"}, {mapd_object}, cat_mapd));
   ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Juventus", mapd_object, cat_mapd));
 
   mapd_object.resetPrivileges();
@@ -456,8 +596,10 @@ TEST_F(DatabaseObject, TableAccessTest) {
       ""));
   auto& cat_mapd = session_ars->get_catalog();
   AccessPrivileges arsenal_privs;
+  AccessPrivileges bayern_privs;
   ASSERT_NO_THROW(arsenal_privs.add(AccessPrivileges::CREATE_TABLE));
   ASSERT_NO_THROW(arsenal_privs.add(AccessPrivileges::DROP_TABLE));
+  ASSERT_NO_THROW(bayern_privs.add(AccessPrivileges::ALTER_TABLE));
   DBObject mapd_object("mapd", DBObjectType::DatabaseDBObjectType);
   privObjects.clear();
   mapd_object.loadKey(cat_mapd);
@@ -482,6 +624,23 @@ TEST_F(DatabaseObject, TableAccessTest) {
   ASSERT_NO_THROW(mapd_object.setPrivileges(AccessPrivileges::CREATE_TABLE));
   privObjects.push_back(mapd_object);
   EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), true);
+
+  mapd_object.resetPrivileges();
+  privObjects.clear();
+  ASSERT_NO_THROW(mapd_object.setPrivileges(bayern_privs));
+  privObjects.push_back(mapd_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), false);
+
+  mapd_object.resetPrivileges();
+  privObjects.clear();
+  ASSERT_NO_THROW(mapd_object.setPrivileges(bayern_privs));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Bayern", mapd_object, cat_mapd));
+
+  mapd_object.resetPrivileges();
+  privObjects.clear();
+  ASSERT_NO_THROW(mapd_object.setPrivileges(bayern_privs));
+  privObjects.push_back(mapd_object);
+  EXPECT_EQ(sys_cat.checkPrivileges("Bayern", privObjects), true);
 }
 
 TEST_F(DatabaseObject, ViewAccessTest) {
@@ -986,8 +1145,8 @@ TEST_F(DashboardObject, AccessAfterGrantsTest) {
   dash_object.loadKey(g_cat);
   ASSERT_NO_THROW(dash_object.setPrivileges(dash_priv));
   privObjects.push_back(dash_object);
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Gunners", dash_object, g_cat));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Juventus", dash_object, g_cat));
+  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivilegesBatch(
+      {"Gunners", "Juventus"}, {dash_object}, g_cat));
 
   privObjects.clear();
   privObjects.push_back(dash_object);
@@ -1008,8 +1167,8 @@ TEST_F(DashboardObject, AccessAfterRevokesTest) {
   dash_object.loadKey(g_cat);
   ASSERT_NO_THROW(dash_object.setPrivileges(dash_priv));
   privObjects.push_back(dash_object);
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("OldLady", dash_object, g_cat));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Arsenal", dash_object, g_cat));
+  ASSERT_NO_THROW(
+      sys_cat.grantDBObjectPrivilegesBatch({"OldLady", "Arsenal"}, {dash_object}, g_cat));
 
   EXPECT_EQ(sys_cat.checkPrivileges("Chelsea", privObjects), true);
   EXPECT_EQ(sys_cat.checkPrivileges("Arsenal", privObjects), true);
@@ -1055,8 +1214,8 @@ TEST_F(DashboardObject, GranteesListAfterGrantsTest) {
   dash_object.loadKey(g_cat);
   ASSERT_NO_THROW(dash_object.setPrivileges(dash_priv));
   privObjects.push_back(dash_object);
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("OldLady", dash_object, g_cat));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Bayern", dash_object, g_cat));
+  ASSERT_NO_THROW(
+      sys_cat.grantDBObjectPrivilegesBatch({"OldLady", "Bayern"}, {dash_object}, g_cat));
   perms_list =
       sys_cat.getMetadataForObject(g_cat.get_currentDB().dbId,
                                    static_cast<int>(DBObjectType::DashboardDBObjectType),
@@ -1098,8 +1257,8 @@ TEST_F(DashboardObject, GranteesListAfterRevokesTest) {
   dash_object.loadKey(g_cat);
   ASSERT_NO_THROW(dash_object.setPrivileges(dash_priv));
   privObjects.push_back(dash_object);
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Gunners", dash_object, g_cat));
-  ASSERT_NO_THROW(sys_cat.grantDBObjectPrivileges("Chelsea", dash_object, g_cat));
+  ASSERT_NO_THROW(
+      sys_cat.grantDBObjectPrivilegesBatch({"Gunners", "Chelsea"}, {dash_object}, g_cat));
   perms_list =
       sys_cat.getMetadataForObject(g_cat.get_currentDB().dbId,
                                    static_cast<int>(DBObjectType::DashboardDBObjectType),

@@ -148,8 +148,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     opTab.addOperator(new Sign());
     opTab.addOperator(new Truncate());
     opTab.addOperator(new ST_Contains());
+    opTab.addOperator(new ST_Intersects());
     opTab.addOperator(new ST_Within());
     opTab.addOperator(new ST_Distance());
+    opTab.addOperator(new ST_MaxDistance());
     opTab.addOperator(new ST_GeogFromText());
     opTab.addOperator(new ST_GeomFromText());
     opTab.addOperator(new ST_Transform());
@@ -176,6 +178,10 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     opTab.addOperator(new LastSample());
     opTab.addOperator(new MapD_GeoPolyBoundsPtr());
     opTab.addOperator(new MapD_GeoPolyRenderGroup());
+    opTab.addOperator(new convert_meters_to_pixel_width());
+    opTab.addOperator(new convert_meters_to_pixel_height());
+    opTab.addOperator(new is_point_in_view());
+    opTab.addOperator(new is_point_size_in_view());
     if (extSigs == null) {
       return;
     }
@@ -659,6 +665,32 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
     }
   }
 
+  static class ST_Intersects extends SqlFunction {
+    ST_Intersects() {
+      super("ST_Intersects",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 2;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> st_intersects_sig =
+              new java.util.ArrayList<SqlTypeFamily>();
+      st_intersects_sig.add(SqlTypeFamily.ANY);
+      st_intersects_sig.add(SqlTypeFamily.ANY);
+      return st_intersects_sig;
+    }
+  }
+
   static class ST_Within extends SqlFunction {
     ST_Within() {
       super("ST_Within",
@@ -708,6 +740,32 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
       st_distance_sig.add(SqlTypeFamily.ANY);
       st_distance_sig.add(SqlTypeFamily.ANY);
       return st_distance_sig;
+    }
+  }
+
+  static class ST_MaxDistance extends SqlFunction {
+    ST_MaxDistance() {
+      super("ST_MaxDistance",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(signature()),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 2;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+    }
+
+    private static java.util.List<SqlTypeFamily> signature() {
+      java.util.List<SqlTypeFamily> st_maxdistance_sig =
+              new java.util.ArrayList<SqlTypeFamily>();
+      st_maxdistance_sig.add(SqlTypeFamily.ANY);
+      st_maxdistance_sig.add(SqlTypeFamily.ANY);
+      return st_maxdistance_sig;
     }
   }
 
@@ -1252,6 +1310,97 @@ public class MapDSqlOperatorTable extends ChainedSqlOperatorTable {
       assert opBinding.getOperandCount() == 1;
       final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
       return typeFactory.createSqlType(SqlTypeName.INTEGER);
+    }
+  }
+
+  static class convert_meters_to_pixel_width extends SqlFunction {
+    convert_meters_to_pixel_width() {
+      super("convert_meters_to_pixel_width",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.ANY,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 6;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+    }
+  }
+
+  static class convert_meters_to_pixel_height extends SqlFunction {
+    convert_meters_to_pixel_height() {
+      super("convert_meters_to_pixel_height",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.ANY,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 6;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.DOUBLE);
+    }
+  }
+
+  static class is_point_in_view extends SqlFunction {
+    is_point_in_view() {
+      super("is_point_in_view",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(SqlTypeFamily.ANY,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 5;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
+    }
+  }
+
+  static class is_point_size_in_view extends SqlFunction {
+    is_point_size_in_view() {
+      super("is_point_size_in_view",
+              SqlKind.OTHER_FUNCTION,
+              null,
+              null,
+              OperandTypes.family(SqlTypeFamily.ANY,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC,
+                      SqlTypeFamily.NUMERIC),
+              SqlFunctionCategory.SYSTEM);
+    }
+
+    @Override
+    public RelDataType inferReturnType(SqlOperatorBinding opBinding) {
+      assert opBinding.getOperandCount() == 6;
+      final RelDataTypeFactory typeFactory = opBinding.getTypeFactory();
+      return typeFactory.createSqlType(SqlTypeName.BOOLEAN);
     }
   }
 }

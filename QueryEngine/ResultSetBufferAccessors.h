@@ -44,16 +44,39 @@ inline bool is_real_str_or_array(const TargetInfo& target_info) {
            target_info.sql_type.get_compression() == kENCODING_NONE));
 }
 
+inline size_t get_slots_for_geo_target(const TargetInfo& target_info,
+                                       const bool separate_varlen_storage) {
+  if (target_info.is_agg || !separate_varlen_storage) {
+    return 2 * target_info.sql_type.get_physical_coord_cols();
+  } else {
+    return target_info.sql_type.get_physical_coord_cols();
+  }
+}
+
+inline size_t get_slots_for_target(const TargetInfo& target_info,
+                                   const bool separate_varlen_storage) {
+  if (target_info.is_agg) {
+    if (target_info.agg_kind == kAVG || is_real_str_or_array(target_info)) {
+      return 2;
+    } else {
+      return 1;
+    }
+  } else {
+    if (is_real_str_or_array(target_info) && !separate_varlen_storage) {
+      return 2;
+    } else {
+      return 1;
+    }
+  }
+}
+
 inline size_t advance_slot(const size_t j,
                            const TargetInfo& target_info,
                            const bool separate_varlen_storage) {
-  if (target_info.sql_type.is_geometry() && !separate_varlen_storage) {
-    return j + 2 * target_info.sql_type.get_physical_coord_cols();
+  if (target_info.sql_type.is_geometry()) {
+    return j + get_slots_for_geo_target(target_info, separate_varlen_storage);
   }
-  return j + ((target_info.agg_kind == kAVG ||
-               (!separate_varlen_storage && is_real_str_or_array(target_info)))
-                  ? 2
-                  : 1);
+  return j + get_slots_for_target(target_info, separate_varlen_storage);
 }
 
 inline size_t slot_offset_rowwise(const size_t entry_idx,
@@ -150,14 +173,15 @@ inline T row_ptr_rowwise(T buff,
 }
 
 template <class T>
-inline T advance_target_ptr(T target_ptr,
-                            const TargetInfo& target_info,
-                            const size_t slot_idx,
-                            const QueryMemoryDescriptor& query_mem_desc,
-                            const bool separate_varlen_storage) {
+inline T advance_target_ptr_row_wise(T target_ptr,
+                                     const TargetInfo& target_info,
+                                     const size_t slot_idx,
+                                     const QueryMemoryDescriptor& query_mem_desc,
+                                     const bool separate_varlen_storage) {
   auto result = target_ptr + query_mem_desc.getColumnWidth(slot_idx).compact;
   if ((target_info.is_agg && target_info.agg_kind == kAVG) ||
-      (is_real_str_or_array(target_info) && !separate_varlen_storage)) {
+      ((!separate_varlen_storage || target_info.is_agg) &&
+       is_real_str_or_array(target_info))) {
     return result + query_mem_desc.getColumnWidth(slot_idx + 1).compact;
   }
   if (target_info.sql_type.is_geometry() && !separate_varlen_storage) {
@@ -166,6 +190,27 @@ inline T advance_target_ptr(T target_ptr,
     }
   }
   return result;
+}
+
+template <class T>
+inline T advance_target_ptr_col_wise(T target_ptr,
+                                     const TargetInfo& target_info,
+                                     const size_t slot_idx,
+                                     const QueryMemoryDescriptor& query_mem_desc,
+                                     const bool separate_varlen_storage) {
+  auto result =
+      advance_to_next_columnar_target_buff(target_ptr, query_mem_desc, slot_idx);
+  if ((target_info.is_agg && target_info.agg_kind == kAVG) ||
+      (is_real_str_or_array(target_info) && !separate_varlen_storage)) {
+    return advance_to_next_columnar_target_buff(result, query_mem_desc, slot_idx + 1);
+  } else if (target_info.sql_type.is_geometry() && !separate_varlen_storage) {
+    for (auto i = 1; i < 2 * target_info.sql_type.get_physical_coord_cols(); ++i) {
+      result = advance_to_next_columnar_target_buff(result, query_mem_desc, slot_idx + i);
+    }
+    return result;
+  } else {
+    return result;
+  }
 }
 
 inline size_t get_slot_off_quad(const QueryMemoryDescriptor& query_mem_desc) {

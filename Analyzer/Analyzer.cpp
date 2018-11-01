@@ -30,6 +30,7 @@
 #include <stdexcept>
 #include "../Catalog/Catalog.h"
 #include "../Shared/sqltypes.h"
+#include "../Shared/unreachable.h"
 
 namespace Analyzer {
 
@@ -153,7 +154,7 @@ std::shared_ptr<Analyzer::Expr> CaseExpr::deep_copy() const {
   std::list<std::pair<std::shared_ptr<Analyzer::Expr>, std::shared_ptr<Analyzer::Expr>>>
       new_list;
   for (auto p : expr_pair_list) {
-    new_list.push_back(std::make_pair(p.first->deep_copy(), p.second->deep_copy()));
+    new_list.emplace_back(p.first->deep_copy(), p.second->deep_copy());
   }
   return makeExpr<CaseExpr>(type_info,
                             contains_agg,
@@ -177,10 +178,6 @@ std::shared_ptr<Analyzer::Expr> DatediffExpr::deep_copy() const {
 
 std::shared_ptr<Analyzer::Expr> DatetruncExpr::deep_copy() const {
   return makeExpr<DatetruncExpr>(type_info, contains_agg, field, from_expr->deep_copy());
-}
-
-std::shared_ptr<Analyzer::Expr> IterExpr::deep_copy() const {
-  return makeExpr<IterExpr>(type_info, table_id, rte_idx);
 }
 
 std::shared_ptr<Analyzer::Expr> OffsetInFragment::deep_copy() const {
@@ -1067,7 +1064,6 @@ void Constant::do_cast(const SQLTypeInfo& new_type_info) {
   } else if (type_info.get_type() == kTIMESTAMP &&
              new_type_info.get_type() == kTIMESTAMP) {
     type_info = new_type_info;
-    constval.timeval *= static_cast<int64_t>(pow(10, type_info.get_dimension()));
   } else if (new_type_info.is_array() && type_info.is_array()) {
     auto new_sub_ti = new_type_info.get_elem_type();
     for (auto& v : value_list) {
@@ -1750,8 +1746,8 @@ std::shared_ptr<Analyzer::Expr> CaseExpr::rewrite_with_targetlist(
   std::list<std::pair<std::shared_ptr<Analyzer::Expr>, std::shared_ptr<Analyzer::Expr>>>
       epair_list;
   for (auto p : expr_pair_list) {
-    epair_list.push_back(std::make_pair(p.first->rewrite_with_targetlist(tlist),
-                                        p.second->rewrite_with_targetlist(tlist)));
+    epair_list.emplace_back(p.first->rewrite_with_targetlist(tlist),
+                            p.second->rewrite_with_targetlist(tlist));
   }
   return makeExpr<CaseExpr>(
       type_info,
@@ -1793,8 +1789,8 @@ std::shared_ptr<Analyzer::Expr> CaseExpr::rewrite_with_child_targetlist(
   std::list<std::pair<std::shared_ptr<Analyzer::Expr>, std::shared_ptr<Analyzer::Expr>>>
       epair_list;
   for (auto p : expr_pair_list) {
-    epair_list.push_back(std::make_pair(p.first->rewrite_with_child_targetlist(tlist),
-                                        p.second->rewrite_with_child_targetlist(tlist)));
+    epair_list.emplace_back(p.first->rewrite_with_child_targetlist(tlist),
+                            p.second->rewrite_with_child_targetlist(tlist));
   }
   return makeExpr<CaseExpr>(
       type_info,
@@ -1836,8 +1832,8 @@ std::shared_ptr<Analyzer::Expr> CaseExpr::rewrite_agg_to_var(
   std::list<std::pair<std::shared_ptr<Analyzer::Expr>, std::shared_ptr<Analyzer::Expr>>>
       epair_list;
   for (auto p : expr_pair_list) {
-    epair_list.push_back(std::make_pair(p.first->rewrite_agg_to_var(tlist),
-                                        p.second->rewrite_agg_to_var(tlist)));
+    epair_list.emplace_back(p.first->rewrite_agg_to_var(tlist),
+                            p.second->rewrite_agg_to_var(tlist));
   }
   return makeExpr<CaseExpr>(type_info,
                             contains_agg,
@@ -1945,9 +1941,10 @@ bool Datum_equal(const SQLTypeInfo& ti, Datum val1, Datum val2) {
     case kMULTIPOLYGON:
       return *val1.stringval == *val2.stringval;
     default:
-      CHECK(false);
+      throw std::runtime_error("Unrecognized type for Constant Datum equality: " +
+                               ti.get_type_name());
   }
-  CHECK(false);
+  UNREACHABLE();
   return false;
 }
 
@@ -1961,6 +1958,9 @@ bool Constant::operator==(const Expr& rhs) const {
   }
   if (is_null && rhs_c.get_is_null()) {
     return true;
+  }
+  if (type_info.is_array()) {
+    return false;
   }
   return Datum_equal(type_info, constval, rhs_c.get_constval());
 }
@@ -2138,14 +2138,6 @@ bool DatetruncExpr::operator==(const Expr& rhs) const {
   }
   const DatetruncExpr& rhs_ee = dynamic_cast<const DatetruncExpr&>(rhs);
   return field == rhs_ee.get_field() && *from_expr == *rhs_ee.get_from_expr();
-}
-
-bool IterExpr::operator==(const Expr& rhs) const {
-  if (typeid(rhs) != typeid(IterExpr)) {
-    return false;
-  }
-  const IterExpr& rhs_ie = static_cast<const IterExpr&>(rhs);
-  return get_table_id() == rhs_ie.get_table_id() && get_rte_idx() == rhs_ie.get_rte_idx();
 }
 
 bool OffsetInFragment::operator==(const Expr& rhs) const {
@@ -2445,10 +2437,6 @@ void DatetruncExpr::print() const {
   std::cout << " , ";
   from_expr->print();
   std::cout << ") ";
-}
-
-void IterExpr::print() const {
-  std::cout << "(Iterator on rte: " << rte_idx << ") ";
 }
 
 void OffsetInFragment::print() const {

@@ -23,6 +23,7 @@
 #include "StreamingTopN.h"
 
 bool g_enable_smem_group_by{true};
+extern bool g_enable_columnar_output;
 
 namespace {
 
@@ -150,9 +151,7 @@ int8_t pick_baseline_key_width(const RelAlgExecutionUnit& ra_exe_unit,
                                const Executor* executor) {
   int8_t compact_width{4};
   for (const auto groupby_expr : ra_exe_unit.groupby_exprs) {
-    const auto actual_expr =
-        redirect_expr(groupby_expr.get(), ra_exe_unit.input_col_descs);
-    const auto expr_range = getExpressionRange(actual_expr.get(), query_infos, executor);
+    const auto expr_range = getExpressionRange(groupby_expr.get(), query_infos, executor);
     compact_width =
         std::max(compact_width, pick_baseline_key_component_width(expr_range));
   }
@@ -174,8 +173,8 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
     const bool must_use_baseline_sort)
     : executor_(executor)
     , allow_multifrag_(allow_multifrag)
-    , hash_type_(ra_exe_unit.estimator ? GroupByColRangeType::Estimator
-                                       : GroupByColRangeType::Scan)
+    , query_desc_type_(ra_exe_unit.estimator ? QueryDescriptionType::Estimator
+                                             : QueryDescriptionType::NonGroupedAggregate)
     , keyless_hash_(false)
     , interleaved_bins_on_gpu_(false)
     , idx_target_as_key_(-1)
@@ -224,10 +223,11 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
     const size_t max_groups_buffer_entry_count,
     RenderInfo* render_info,
     const CountDistinctDescriptors count_distinct_descriptors,
-    const bool must_use_baseline_sort)
+    const bool must_use_baseline_sort,
+    const bool output_columnar_hint)
     : executor_(executor)
     , allow_multifrag_(allow_multifrag)
-    , hash_type_(col_range_info.hash_type_)
+    , query_desc_type_(col_range_info.hash_type_)
     , keyless_hash_(false)
     , interleaved_bins_on_gpu_(false)
     , idx_target_as_key_(-1)
@@ -259,15 +259,19 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
         {wid, static_cast<int8_t>(compact_byte_width(wid, min_byte_width))});
   }
 
-  switch (hash_type_) {
-    case GroupByColRangeType::OneColKnownRange: {
+  switch (query_desc_type_) {
+    case QueryDescriptionType::GroupByPerfectHash: {
       CHECK(!render_info || !render_info->isPotentialInSituRender());
-
-      const auto redirected_targets =
-          redirect_exprs(ra_exe_unit.target_exprs, ra_exe_unit.input_col_descs);
-
-      const auto keyless_info = group_by_and_agg->getKeylessInfo(
-          get_exprs_not_owned(redirected_targets), is_group_by);
+      // multi-column group by query:
+      if (group_col_widths_.size() > 1) {
+        // max_val_ contains the expected cardinality of the output
+        entry_count_ = static_cast<size_t>(max_val_);
+        bucket_ = 0;
+        return;
+      }
+      // single-column group by query:
+      const auto keyless_info =
+          group_by_and_agg->getKeylessInfo(ra_exe_unit.target_exprs, is_group_by);
       idx_target_as_key_ = keyless_info.target_index;
       init_val_ = keyless_info.init_val;
 
@@ -312,14 +316,28 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
           agg_col_widths_.push_back({wid, static_cast<int8_t>(wid ? 8 : 0)});
         }
       }
-
       const auto group_expr = ra_exe_unit.groupby_exprs.front().get();
       bool shared_mem_for_group_by =
           g_enable_smem_group_by && keyless_hash_ && keyless_info.shared_mem_support &&
           (entry_count_ <= gpu_smem_max_threshold) &&
           (group_by_and_agg->supportedExprForGpuSharedMemUsage(group_expr)) &&
           QueryMemoryDescriptor::countDescriptorsLogicallyEmpty(
-              count_distinct_descriptors);
+              count_distinct_descriptors) &&
+          !output_columnar_;  // TODO(Saman): add columnar support with the new smem
+                              // support.
+
+      bool has_varlen_sample_agg = false;
+      for (const auto& target_expr : ra_exe_unit.target_exprs) {
+        if (target_expr->get_contains_agg()) {
+          const auto agg_expr = dynamic_cast<Analyzer::AggExpr*>(target_expr);
+          CHECK(agg_expr);
+          if (agg_expr->get_aggtype() == kSAMPLE &&
+              agg_expr->get_type_info().is_varlen()) {
+            has_varlen_sample_agg = true;
+            break;
+          }
+        }
+      }
 
       // TODO(Saman): should remove this after implementing shared memory path completely
       // through codegen We should not use the current shared memory path if more than 8
@@ -328,20 +346,17 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
         // TODO(adb / saman): Move this into a different enum so we can remove
         // GroupByMemSharing
         sharing_ = GroupByMemSharing::SharedForKeylessOneColumnKnownRange;
-
-        interleaved_bins_on_gpu_ = !shared_mem_for_group_by && keyless_hash_ &&
-                                   (entry_count_ <= interleaved_max_threshold) &&
-                                   QueryMemoryDescriptor::countDescriptorsLogicallyEmpty(
-                                       count_distinct_descriptors);
+        interleaved_bins_on_gpu_ = false;
       } else {
-        interleaved_bins_on_gpu_ = keyless_hash_ &&
+        interleaved_bins_on_gpu_ = keyless_hash_ && !has_varlen_sample_agg &&
                                    (entry_count_ <= interleaved_max_threshold) &&
                                    QueryMemoryDescriptor::countDescriptorsLogicallyEmpty(
                                        count_distinct_descriptors);
       }
       return;
     }
-    case GroupByColRangeType::MultiCol: {
+    case QueryDescriptionType::GroupByBaselineHash: {
+      output_columnar_ = output_columnar_hint;
       CHECK(!render_info || !render_info->isPotentialInSituRender());
       entry_count_ = shard_count
                          ? (max_groups_buffer_entry_count + shard_count - 1) / shard_count
@@ -351,7 +366,8 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
                                                              ra_exe_unit.target_exprs);
 
       group_col_compact_width_ =
-          pick_baseline_key_width(ra_exe_unit, query_infos, executor);
+          output_columnar_ ? 8
+                           : pick_baseline_key_width(ra_exe_unit, query_infos, executor);
 
       agg_col_widths_.clear();
       for (auto wid :
@@ -368,14 +384,16 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
       has_nulls_ = false;
       return;
     }
-    case GroupByColRangeType::Projection: {
+    case QueryDescriptionType::Projection: {
       CHECK(!must_use_baseline_sort);
+
+      output_columnar_ = output_columnar_hint;
 
       // Only projection queries support in-situ rendering
       render_output_ = render_info && render_info->isPotentialInSituRender();
 
       // TODO(adb): Can we attach this to the QMD as a class member?
-      if (use_streaming_top_n(ra_exe_unit, *this)) {
+      if (use_streaming_top_n(ra_exe_unit, *this) && !output_columnar_hint) {
         entry_count_ = ra_exe_unit.sort_info.offset + ra_exe_unit.sort_info.limit;
       } else {
         entry_count_ = ra_exe_unit.scan_limit
@@ -398,13 +416,6 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
       }
 
       bucket_ = 0;
-
-      return;
-    }
-    case GroupByColRangeType::MultiColPerfectHash: {
-      CHECK(!render_info || !render_info->isPotentialInSituRender());
-      entry_count_ = static_cast<size_t>(max_val_);
-      bucket_ = 0;
       return;
     }
     default:
@@ -415,7 +426,7 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
 QueryMemoryDescriptor::QueryMemoryDescriptor()
     : executor_(nullptr)
     , allow_multifrag_(false)
-    , hash_type_(GroupByColRangeType::Projection)
+    , query_desc_type_(QueryDescriptionType::Projection)
     , keyless_hash_(false)
     , interleaved_bins_on_gpu_(false)
     , idx_target_as_key_(0)
@@ -435,10 +446,10 @@ QueryMemoryDescriptor::QueryMemoryDescriptor()
 
 QueryMemoryDescriptor::QueryMemoryDescriptor(const Executor* executor,
                                              const size_t entry_count,
-                                             const GroupByColRangeType hash_type)
+                                             const QueryDescriptionType query_desc_type)
     : executor_(nullptr)
     , allow_multifrag_(false)
-    , hash_type_(hash_type)
+    , query_desc_type_(query_desc_type)
     , keyless_hash_(false)
     , interleaved_bins_on_gpu_(false)
     , idx_target_as_key_(0)
@@ -456,14 +467,14 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(const Executor* executor,
     , must_use_baseline_sort_(false)
     , force_4byte_float_(false) {}
 
-QueryMemoryDescriptor::QueryMemoryDescriptor(const GroupByColRangeType hash_type,
+QueryMemoryDescriptor::QueryMemoryDescriptor(const QueryDescriptionType query_desc_type,
                                              const int64_t min_val,
                                              const int64_t max_val,
                                              const bool has_nulls,
                                              const std::vector<int8_t>& group_col_widths)
     : executor_(nullptr)
     , allow_multifrag_(false)
-    , hash_type_(hash_type)
+    , query_desc_type_(query_desc_type)
     , keyless_hash_(false)
     , interleaved_bins_on_gpu_(false)
     , idx_target_as_key_(0)
@@ -485,7 +496,7 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(const GroupByColRangeType hash_type
 QueryMemoryDescriptor::QueryMemoryDescriptor(
     const Executor* executor,
     const bool allow_multifrag,
-    const GroupByColRangeType hash_type,
+    const QueryDescriptionType query_desc_type,
     const bool keyless_hash,
     const bool interleaved_bins_on_gpu,
     const int32_t idx_target_as_key,
@@ -510,7 +521,7 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
     : agg_col_widths_(agg_col_widths)
     , executor_(executor)
     , allow_multifrag_(allow_multifrag)
-    , hash_type_(hash_type)
+    , query_desc_type_(query_desc_type)
     , keyless_hash_(keyless_hash)
     , interleaved_bins_on_gpu_(interleaved_bins_on_gpu)
     , idx_target_as_key_(idx_target_as_key)
@@ -536,7 +547,7 @@ QueryMemoryDescriptor::QueryMemoryDescriptor(
 bool QueryMemoryDescriptor::operator==(const QueryMemoryDescriptor& other) const {
   // Note that this method does not check ptr reference members (e.g. executor_) or
   // entry_count_
-  if (hash_type_ != other.hash_type_) {
+  if (query_desc_type_ != other.query_desc_type_) {
     return false;
   }
   if (keyless_hash_ != other.keyless_hash_) {
@@ -853,13 +864,12 @@ size_t QueryMemoryDescriptor::getColOffInBytes(const size_t bin,
   CHECK_LT(col_idx, agg_col_widths_.size());
   const auto warp_count = getWarpCount();
   if (output_columnar_) {
-    CHECK_LT(bin, entry_count_);
-    CHECK_EQ(size_t(1), group_col_widths_.size());
+    CHECK((bin < entry_count_) || (bin == 0 && entry_count_ == 0));
     CHECK_EQ(size_t(1), warp_count);
     size_t offset{0};
     const auto is_isometric = isCompactLayoutIsometric();
     if (!keyless_hash_) {
-      offset = sizeof(int64_t) * entry_count_;
+      offset = group_col_widths_.size() * sizeof(int64_t) * entry_count_;
     }
     for (size_t index = 0; index < col_idx; ++index) {
       offset += agg_col_widths_[index].compact * entry_count_;
@@ -977,16 +987,18 @@ size_t QueryMemoryDescriptor::getBufferSizeBytes(
 }
 
 bool QueryMemoryDescriptor::usesGetGroupValueFast() const {
-  return hash_type_ == GroupByColRangeType::OneColKnownRange;
+  return (query_desc_type_ == QueryDescriptionType::GroupByPerfectHash &&
+          getGroupbyColCount() == 1);
 }
 
 bool QueryMemoryDescriptor::usesCachedContext() const {
-  return allow_multifrag_ && (usesGetGroupValueFast() ||
-                              hash_type_ == GroupByColRangeType::MultiColPerfectHash);
+  return allow_multifrag_ &&
+         (usesGetGroupValueFast() ||
+          query_desc_type_ == QueryDescriptionType::GroupByPerfectHash);
 }
 
 bool QueryMemoryDescriptor::threadsShareMemory() const {
-  return hash_type_ != GroupByColRangeType::Scan;
+  return query_desc_type_ != QueryDescriptionType::NonGroupedAggregate;
 }
 
 bool QueryMemoryDescriptor::blocksShareMemory() const {
@@ -997,9 +1009,10 @@ bool QueryMemoryDescriptor::blocksShareMemory() const {
     return true;
   }
   if (executor_->isCPUOnly() || render_output_ ||
-      hash_type_ == GroupByColRangeType::MultiCol ||
-      hash_type_ == GroupByColRangeType::Projection ||
-      hash_type_ == GroupByColRangeType::MultiColPerfectHash) {
+      query_desc_type_ == QueryDescriptionType::GroupByBaselineHash ||
+      query_desc_type_ == QueryDescriptionType::Projection ||
+      (query_desc_type_ == QueryDescriptionType::GroupByPerfectHash &&
+       getGroupbyColCount() > 1)) {
     return true;
   }
   return usesCachedContext() && !sharedMemBytes(ExecutorDeviceType::GPU) &&

@@ -1153,12 +1153,12 @@ class CopyTableStmt : public DDLStmt {
  */
 class CreateRoleStmt : public DDLStmt {
  public:
-  CreateRoleStmt(const std::string& r) : role(r) {}
-  const std::string& get_role() const { return role; }
+  CreateRoleStmt(std::string* r) : role(r) {}
+  const std::string& get_role() const { return *role; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string role;
+  std::unique_ptr<std::string> role;
 };
 
 /*
@@ -1167,13 +1167,23 @@ class CreateRoleStmt : public DDLStmt {
  */
 class DropRoleStmt : public DDLStmt {
  public:
-  DropRoleStmt(const std::string& r) : role(r) {}
-  const std::string& get_role() const { return role; }
+  DropRoleStmt(std::string* r) : role(r) {}
+  const std::string& get_role() const { return *role; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string role;
+  std::unique_ptr<std::string> role;
 };
+
+inline void parser_slistval_to_vector(std::list<std::string*>* l,
+                                      std::vector<std::string>& v) {
+  CHECK(l);
+  for (auto str : *l) {
+    v.push_back(*str);
+    delete str;
+  }
+  delete l;
+}
 
 /*
  * @type GrantPrivilegesStmt
@@ -1181,22 +1191,26 @@ class DropRoleStmt : public DDLStmt {
  */
 class GrantPrivilegesStmt : public DDLStmt {
  public:
-  GrantPrivilegesStmt(const std::string& p,
-                      const std::string& t,
-                      const std::string& o,
-                      const std::string& r)
-      : priv(p), object_type(t), object(o), role(r) {}
-  const std::string& get_priv() const { return priv; }
-  const std::string& get_object_type() const { return object_type; }
-  const std::string& get_object() const { return object; }
-  const std::string& get_role() const { return role; }
+  GrantPrivilegesStmt(std::list<std::string*>* p,
+                      std::string* t,
+                      std::string* o,
+                      std::list<std::string*>* g)
+      : object_type(t), object(o) {
+    parser_slistval_to_vector(p, privs);
+    parser_slistval_to_vector(g, grantees);
+  }
+
+  const std::vector<std::string>& get_privs() const { return privs; }
+  const std::string& get_object_type() const { return *object_type; }
+  const std::string& get_object() const { return *object; }
+  const std::vector<std::string>& get_grantees() const { return grantees; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string priv;
-  const std::string object_type;
-  const std::string object;
-  const std::string role;
+  std::vector<std::string> privs;
+  std::unique_ptr<std::string> object_type;
+  std::unique_ptr<std::string> object;
+  std::vector<std::string> grantees;
 };
 
 /*
@@ -1205,22 +1219,26 @@ class GrantPrivilegesStmt : public DDLStmt {
  */
 class RevokePrivilegesStmt : public DDLStmt {
  public:
-  RevokePrivilegesStmt(const std::string& p,
-                       const std::string& t,
-                       const std::string& o,
-                       const std::string& r)
-      : priv(p), object_type(t), object(o), role(r) {}
-  const std::string& get_priv() const { return priv; }
-  const std::string& get_object_type() const { return object_type; }
-  const std::string& get_object() const { return object; }
-  const std::string& get_role() const { return role; }
+  RevokePrivilegesStmt(std::list<std::string*>* p,
+                       std::string* t,
+                       std::string* o,
+                       std::list<std::string*>* g)
+      : object_type(t), object(o) {
+    parser_slistval_to_vector(p, privs);
+    parser_slistval_to_vector(g, grantees);
+  }
+
+  const std::vector<std::string>& get_privs() const { return privs; }
+  const std::string& get_object_type() const { return *object_type; }
+  const std::string& get_object() const { return *object; }
+  const std::vector<std::string>& get_grantees() const { return grantees; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string priv;
-  const std::string object_type;
-  const std::string object;
-  const std::string role;
+  std::vector<std::string> privs;
+  std::unique_ptr<std::string> object_type;
+  std::unique_ptr<std::string> object;
+  std::vector<std::string> grantees;
 };
 
 /*
@@ -1229,17 +1247,17 @@ class RevokePrivilegesStmt : public DDLStmt {
  */
 class ShowPrivilegesStmt : public DDLStmt {
  public:
-  ShowPrivilegesStmt(const std::string& t, const std::string& o, const std::string& r)
+  ShowPrivilegesStmt(std::string* t, std::string* o, std::string* r)
       : object_type(t), object(o), role(r) {}
-  const std::string& get_object_type() const { return object_type; }
-  const std::string& get_object() const { return object; }
-  const std::string& get_role() const { return role; }
+  const std::string& get_object_type() const { return *object_type; }
+  const std::string& get_object() const { return *object; }
+  const std::string& get_role() const { return *role; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string object_type;
-  const std::string object;
-  const std::string role;
+  std::unique_ptr<std::string> object_type;
+  std::unique_ptr<std::string> object;
+  std::unique_ptr<std::string> role;
 };
 
 /*
@@ -1248,14 +1266,17 @@ class ShowPrivilegesStmt : public DDLStmt {
  */
 class GrantRoleStmt : public DDLStmt {
  public:
-  GrantRoleStmt(const std::string& r, const std::string& u) : role(r), user(u) {}
-  const std::string& get_role() const { return role; }
-  const std::string& get_user() const { return user; }
+  GrantRoleStmt(std::list<std::string*>* r, std::list<std::string*>* g) {
+    parser_slistval_to_vector(r, roles);
+    parser_slistval_to_vector(g, grantees);
+  }
+  const std::vector<std::string>& get_roles() const { return roles; }
+  const std::vector<std::string>& get_grantees() const { return grantees; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string role;
-  const std::string user;
+  std::vector<std::string> roles;
+  std::vector<std::string> grantees;
 };
 
 /*
@@ -1264,14 +1285,17 @@ class GrantRoleStmt : public DDLStmt {
  */
 class RevokeRoleStmt : public DDLStmt {
  public:
-  RevokeRoleStmt(const std::string& r, const std::string& u) : role(r), user(u) {}
-  const std::string& get_role() const { return role; }
-  const std::string& get_user() const { return user; }
+  RevokeRoleStmt(std::list<std::string*>* r, std::list<std::string*>* g) {
+    parser_slistval_to_vector(r, roles);
+    parser_slistval_to_vector(g, grantees);
+  }
+  const std::vector<std::string>& get_roles() const { return roles; }
+  const std::vector<std::string>& get_grantees() const { return grantees; }
   virtual void execute(const Catalog_Namespace::SessionInfo& session);
 
  private:
-  const std::string role;
-  const std::string user;
+  std::vector<std::string> roles;
+  std::vector<std::string> grantees;
 };
 
 /*

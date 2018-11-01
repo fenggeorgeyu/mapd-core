@@ -49,6 +49,7 @@
 #include "../Shared/measure.h"
 #include "DataMgr/LockMgr.h"
 #include "ReservedKeywords.h"
+#include "TargetValueConvertersFactories.h"
 #include "gen-cpp/CalciteServer.h"
 #include "parser.h"
 
@@ -57,6 +58,7 @@ bool g_fast_strcmp{true};
 
 using namespace Lock_Namespace;
 using Catalog_Namespace::SysCatalog;
+using namespace std::string_literals;
 
 namespace Importer_NS {
 
@@ -909,7 +911,7 @@ std::shared_ptr<Analyzer::Expr> CaseExpr::normalize(
       cast_expr_pair_list;
   for (auto p : expr_pair_list) {
     ti.set_notnull(false);
-    cast_expr_pair_list.push_back(std::make_pair(p.first, p.second->add_cast(ti)));
+    cast_expr_pair_list.emplace_back(p.first, p.second->add_cast(ti));
   }
   if (else_e != nullptr) {
     else_e = else_e->add_cast(ti);
@@ -2033,10 +2035,15 @@ void SQLType::check_type() {
     case kTIMESTAMP:
       if (param1 == -1) {
         param1 = 0;  // set default to 0
+#ifdef DISABLE_HIGH_PRECISION_TIMESTAMP
+      } else if (param1 != 0) {  // temporarily disable all but seconds
+        throw std::runtime_error("Only TIMESTAMP(0) is supported now.");
+#else
       } else if (param1 != 0 && param1 != 3 && param1 != 6 &&
                  param1 != 9) {  // support milli/micro/nanosec precision
         throw std::runtime_error(
             "Only TIMESTAMP(n) where n = (0,3,6,9) are supported now.");
+#endif
       }
       break;
     case kTIME:
@@ -2436,28 +2443,29 @@ void CreateTableAsSelectStmt::execute(const Catalog_Namespace::SessionInfo& sess
 
   std::vector<TargetMetaInfo> target_metainfos;
   const auto result_rows = getResultRows(session, select_query_, target_metainfos);
-  std::list<ColumnDescriptor> column_descriptors;
-  std::vector<SQLTypeInfo> logical_column_types;
+  result_rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
+
+  std::list<ColumnDescriptor> column_descriptors_for_create;
+  std::vector<ColumnDescriptor> column_descriptors;
+  std::vector<std::unique_ptr<TargetValueConverter>> value_converters;
+  const auto num_rows = result_rows->rowCount();
+
   for (const auto& target_metainfo : target_metainfos) {
     ColumnDescriptor cd;
     cd.columnName = target_metainfo.get_resname();
-    cd.columnType = target_metainfo.get_type_info();
-    if (cd.columnType.get_size() < 0) {
-      throw std::runtime_error("Variable-length type " + cd.columnType.get_type_name() +
-                               " not supported in CTAS");
-    }
-    if (cd.columnType.get_compression() == kENCODING_FIXED) {
-      throw std::runtime_error("Fixed encoding integers not supported in CTAS");
-    }
+    cd.columnType = target_metainfo.get_physical_type_info();
+
+    ColumnDescriptor cd_for_create = cd;
+
     if (cd.columnType.get_compression() == kENCODING_DICT) {
-      cd.columnType.set_comp_param(cd.columnType.get_size() * 8);
-      logical_column_types.push_back(target_metainfo.get_type_info());
-    } else {
-      logical_column_types.push_back(
-          get_logical_type_info(target_metainfo.get_type_info()));
+      // we need to reset the comp param (as this points to the actual dictionary)
+      cd_for_create.columnType.set_comp_param(cd.columnType.get_size() * 8);
     }
+
+    column_descriptors_for_create.push_back(cd_for_create);
     column_descriptors.push_back(cd);
   }
+
   TableDescriptor td;
   td.tableName = table_name_;
   td.userId = session.get_currentUser().userId;
@@ -2475,50 +2483,90 @@ void CreateTableAsSelectStmt::execute(const Catalog_Namespace::SessionInfo& sess
   } else {
     td.persistenceLevel = Data_Namespace::MemoryLevel::DISK_LEVEL;
   }
-  catalog.createTable(td, column_descriptors, {}, true);
+  catalog.createTable(td, column_descriptors_for_create, {}, true);
   if (result_rows->definitelyHasNoRows()) {
     return;
   }
-  const TableDescriptor* created_td{nullptr};
+
+  const TableDescriptor* created_td = catalog.getMetadataForTable(table_name_);
+
+  TargetValueConverterFactory factory;
+
+  for (const auto& cd : column_descriptors) {
+    const ColumnDescriptor* sourceDescriptor = &cd;
+    const ColumnDescriptor* targetDescriptor =
+        catalog.getMetadataForColumn(created_td->tableId, cd.columnName);
+
+    ConverterCreateParameter param{num_rows,
+                                   catalog,
+                                   sourceDescriptor,
+                                   targetDescriptor,
+                                   targetDescriptor->columnType,
+                                   !targetDescriptor->columnType.get_notnull()};
+    auto converter = factory.create(param);
+    value_converters.push_back(std::move(converter));
+  }
+
+  const int num_cols = value_converters.size();
+  bool can_go_parallel = !result_rows->isTruncated() && num_rows > 20000;
+
+  if (can_go_parallel) {
+    const size_t entryCount = result_rows->entryCount();
+    const size_t num_worker_threads = cpu_threads();
+    std::atomic<size_t> row_idx{0};
+    std::vector<std::future<size_t>> worker_threads;
+    for (size_t i = 0,
+                start_entry = 0,
+                stride = (entryCount + num_worker_threads - 1) / num_worker_threads;
+         i < num_worker_threads && start_entry < entryCount;
+         ++i, start_entry += stride) {
+      const auto end_entry = std::min(start_entry + stride, entryCount);
+      worker_threads.push_back(
+          std::async(std::launch::async,
+                     [&result_rows, &value_converters, &num_cols, &row_idx](
+                         const size_t start, const size_t end) {
+                       size_t row_count{0};
+                       for (size_t i = start; i < end; ++i) {
+                         const auto result_row = result_rows->getRowAtNoTranslations(i);
+                         if (!result_row.empty()) {
+                           size_t target_row = row_idx.fetch_add(1);
+                           for (unsigned int col = 0; col < num_cols; col++) {
+                             const auto& mapd_variant = result_row[col];
+                             value_converters[col]->convertToColumnarFormat(
+                                 target_row, &mapd_variant);
+                           }
+                         }
+                       }
+                       return row_count;
+                     },
+                     start_entry,
+                     end_entry));
+    }
+
+    for (auto& child : worker_threads) {
+      child.wait();
+    }
+
+  } else {
+    for (size_t row = 0; row < num_rows; row++) {
+      const auto result_row = result_rows->getNextRow(false, false);
+      for (unsigned int col = 0; col < num_cols; col++) {
+        const auto& mapd_variant = result_row[col];
+        value_converters[col]->convertToColumnarFormat(row, &mapd_variant);
+      }
+    }
+  }
+
   try {
-    const auto row_set_mem_owner = result_rows->getRowSetMemOwner();
-    ColumnarResults columnar_results(
-        row_set_mem_owner, *result_rows, column_descriptors.size(), logical_column_types);
     Fragmenter_Namespace::InsertData insert_data;
     insert_data.databaseId = catalog.get_currentDB().dbId;
-    created_td = catalog.getMetadataForTable(table_name_);
     CHECK(created_td);
     insert_data.tableId = created_td->tableId;
-    std::vector<int> column_ids;
-    const auto& column_buffers = columnar_results.getColumnBuffers();
-    CHECK_EQ(column_descriptors.size(), column_buffers.size());
-    size_t col_idx = 0;
-    std::vector<std::unique_ptr<int8_t[]>> dest_string_ids_owner;
+
+    int col_idx = 0;
     for (const auto cd : column_descriptors) {
-      DataBlockPtr p;
-      const auto created_cd =
-          catalog.getMetadataForColumn(insert_data.tableId, cd.columnName);
-      CHECK(created_cd);
-      column_ids.push_back(created_cd->columnId);
-      if (created_cd->columnType.get_compression() == kENCODING_DICT) {
-        const auto source_dd = catalog.getMetadataForDict(
-            target_metainfos[col_idx].get_type_info().get_comp_param());
-        CHECK(source_dd);
-        const auto dest_dd =
-            catalog.getMetadataForDict(created_cd->columnType.get_comp_param());
-        CHECK(dest_dd);
-        const auto dest_ids = fill_dict_column(dest_string_ids_owner,
-                                               dest_dd->stringDict.get(),
-                                               column_buffers[col_idx],
-                                               source_dd->stringDict.get(),
-                                               columnar_results.size(),
-                                               created_cd->columnType);
-        p.numbersPtr = reinterpret_cast<int8_t*>(dest_ids);
-      } else {
-        p.numbersPtr = const_cast<int8_t*>(column_buffers[col_idx]);
-      }
-      insert_data.data.push_back(p);
-      ++col_idx;
+      value_converters[col_idx++]->addDataBlocksToInsertData(insert_data);
+      continue;
     }
     // get CheckpointLock+UpdateDeleteLock locks on the table before trying to create its
     // 1st fragment
@@ -2528,8 +2576,7 @@ void CreateTableAsSelectStmt::execute(const Catalog_Namespace::SessionInfo& sess
             Lock_Namespace::LockType::CheckpointLock, chunkKey));
     // [ write UpdateDeleteLocks ] lock is deferred in
     // InsertOrderFragmenter::deleteFragments
-    insert_data.columnIds = column_ids;
-    insert_data.numRows = columnar_results.size();
+    insert_data.numRows = num_rows;
     created_td->fragmenter->insertData(insert_data);
   } catch (...) {
     if (created_td) {
@@ -2601,18 +2648,33 @@ void TruncateTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   catalog.truncateTable(td);
 }
 
+void check_alter_table_privilege(const Catalog_Namespace::SessionInfo& session,
+                                 const TableDescriptor* td) {
+  if (!SysCatalog::instance().arePrivilegesOn()) {
+    return;
+  }
+  if (session.get_currentUser().isSuper ||
+      session.get_currentUser().userId == td->userId) {
+    return;
+  }
+  std::vector<DBObject> privObjects;
+  DBObject dbObject(td->tableName, TableDBObjectType);
+  dbObject.loadKey(session.get_catalog());
+  dbObject.setPrivileges(AccessPrivileges::ALTER_TABLE);
+  privObjects.push_back(dbObject);
+  if (!SysCatalog::instance().checkPrivileges(session.get_currentUser(), privObjects)) {
+    throw std::runtime_error("Current user does not have the privilege to alter table: " +
+                             td->tableName);
+  }
+}
+
 void RenameTableStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   auto& catalog = session.get_catalog();
   const TableDescriptor* td = catalog.getMetadataForTable(*table);
-  // check for superuser/owner
-  if (!session.get_currentUser().isSuper &&
-      session.get_currentUser().userId != td->userId) {
-    throw std::runtime_error("Current user doesn't have the privilege to alter table: " +
-                             *table + " Only superusers or owner can alter a table.");
-  }
   if (td == nullptr) {
     throw std::runtime_error("Table " + *table + " does not exist.");
   }
+  check_alter_table_privilege(session, td);
   if (catalog.getMetadataForTable(*new_table_name) != nullptr) {
     throw std::runtime_error("Table or View " + *new_table_name + " already exists.");
   }
@@ -2650,6 +2712,12 @@ void DDLStmt::setColumnDescriptor(ColumnDescriptor& cd, const ColumnDef* coldef)
       // default to 32-bits
       cd.columnType.set_compression(kENCODING_DICT);
       cd.columnType.set_comp_param(32);
+    } else if (cd.columnType.is_decimal() && cd.columnType.get_precision() <= 4) {
+      cd.columnType.set_compression(kENCODING_FIXED);
+      cd.columnType.set_comp_param(16);
+    } else if (cd.columnType.is_decimal() && cd.columnType.get_precision() <= 9) {
+      cd.columnType.set_compression(kENCODING_FIXED);
+      cd.columnType.set_comp_param(32);
     } else if (cd.columnType.is_geometry() && cd.columnType.get_output_srid() == 4326) {
       // default to GEOINT 32-bits
       cd.columnType.set_compression(kENCODING_GEOINT);
@@ -2662,7 +2730,8 @@ void DDLStmt::setColumnDescriptor(ColumnDescriptor& cd, const ColumnDef* coldef)
     const std::string& comp = *compression->get_encoding_name();
     int comp_param;
     if (boost::iequals(comp, "fixed")) {
-      if (!cd.columnType.is_integer() && !cd.columnType.is_time()) {
+      if (!cd.columnType.is_integer() && !cd.columnType.is_time() &&
+          !cd.columnType.is_decimal()) {
         throw std::runtime_error(
             cd.columnName +
             ": Fixed encoding is only supported for integer or time columns.");
@@ -2705,6 +2774,28 @@ void DDLStmt::setColumnDescriptor(ColumnDescriptor& cd, const ColumnDef* coldef)
                                      ": Compression parameter for Fixed encoding on "
                                      "TIME, DATE or TIMESTAMP must 32.");
           }
+          break;
+        case kDECIMAL:
+        case kNUMERIC:
+          if (compression->get_encoding_param() != 32 &&
+              compression->get_encoding_param() != 16) {
+            throw std::runtime_error(
+                cd.columnName +
+                ": Compression parameter for Fixed encoding on DECIMAL must 16 or 32.");
+          }
+
+          if (compression->get_encoding_param() == 32 &&
+              cd.columnType.get_precision() > 9) {
+            throw std::runtime_error(
+                cd.columnName + ": Precision too high for Fixed(32) encoding, max 9.");
+          }
+
+          if (compression->get_encoding_param() == 16 &&
+              cd.columnType.get_precision() > 4) {
+            throw std::runtime_error(
+                cd.columnName + ": Precision too high for Fixed(16) encoding, max 4.");
+          }
+
           break;
         default:
           throw std::runtime_error(cd.columnName + ": Cannot apply FIXED encoding to " +
@@ -2812,32 +2903,12 @@ void DDLStmt::setColumnDescriptor(ColumnDescriptor& cd, const ColumnDef* coldef)
       s = array_size * sti.get_size();
     }
     cd.columnType.set_size(s);
+
   } else {
     cd.columnType.set_fixed_size();
   }
   cd.isSystemCol = false;
   cd.isVirtualCol = false;
-}
-
-void check_alter_table_privilege(const Catalog_Namespace::SessionInfo& session,
-                                 const TableDescriptor* td) {
-  if (!SysCatalog::instance().arePrivilegesOn()) {
-    return;
-  }
-  if (session.get_currentUser().isSuper ||
-      session.get_currentUser().userId == td->userId) {
-    return;
-  }
-  std::vector<DBObject> privObjects;
-  DBObject dbObject(td->tableName, TableDBObjectType);
-  dbObject.loadKey(session.get_catalog());
-  dbObject.setPrivileges(AccessPrivileges::ALTER_TABLE);
-  privObjects.push_back(dbObject);
-  if (!SysCatalog::instance().checkPrivileges(session.get_currentUser(), privObjects)) {
-    throw std::runtime_error(
-        "Current user doesn't have the privilege to alter columns of table: " +
-        td->tableName);
-  }
 }
 
 void AddColumnStmt::execute(const Catalog_Namespace::SessionInfo& session) {
@@ -2993,15 +3064,10 @@ void AddColumnStmt::execute(const Catalog_Namespace::SessionInfo& session) {
 void RenameColumnStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   auto& catalog = session.get_catalog();
   const TableDescriptor* td = catalog.getMetadataForTable(*table);
-  // check for superuser/owner
-  if (!session.get_currentUser().isSuper &&
-      session.get_currentUser().userId != td->userId) {
-    throw std::runtime_error("Current user doesn't have the privilege to alter table: " +
-                             *table + " Only superusers or owner can alter a table.");
-  }
   if (td == nullptr) {
     throw std::runtime_error("Table " + *table + " does not exist.");
   }
+  check_alter_table_privilege(session, td);
   const ColumnDescriptor* cd = catalog.getMetadataForColumn(td->tableId, *column);
   if (cd == nullptr) {
     throw std::runtime_error("Column " + *column + " does not exist.");
@@ -3385,8 +3451,8 @@ void DropRoleStmt::execute(const Catalog_Namespace::SessionInfo& session) {
     throw std::runtime_error("DROP ROLE " + get_role() +
                              " failed. It can only be executed by super user.");
   }
-  Role* rl = SysCatalog::instance().getMetadataForRole(get_role());
-  if (!rl || rl->isUserPrivateRole()) {
+  auto* rl = SysCatalog::instance().getRoleGrantee(get_role());
+  if (!rl) {
     throw std::runtime_error("DROP ROLE " + get_role() +
                              " failed because role with this name does not exist.");
   }
@@ -3437,90 +3503,86 @@ static std::pair<AccessPrivileges, DBObjectType> parseStringPrivs(
     const std::string& privs,
     const DBObjectType& objectType,
     const std::string& object_name) {
-  if (privs.compare("ALL") == 0) {
-    if (objectType == DatabaseDBObjectType) {
-      return {AccessPrivileges::ALL_DATABASE, DatabaseDBObjectType};
-    } else if (objectType == TableDBObjectType) {
-      return {AccessPrivileges::ALL_TABLE, TableDBObjectType};
-    } else if (objectType == DashboardDBObjectType) {
-      return {AccessPrivileges::ALL_DASHBOARD, DashboardDBObjectType};
-    } else if (objectType == ViewDBObjectType) {
-      return {AccessPrivileges::ALL_VIEW, ViewDBObjectType};
-    }
+  static const std::map<std::pair<const std::string, const DBObjectType>,
+                        std::pair<const AccessPrivileges, const DBObjectType>>
+      privileges_lookup{
+          {{"ALL"s, DatabaseDBObjectType},
+           {AccessPrivileges::ALL_DATABASE, DatabaseDBObjectType}},
+          {{"ALL"s, TableDBObjectType}, {AccessPrivileges::ALL_TABLE, TableDBObjectType}},
+          {{"ALL"s, DashboardDBObjectType},
+           {AccessPrivileges::ALL_DASHBOARD, DashboardDBObjectType}},
+          {{"ALL"s, ViewDBObjectType}, {AccessPrivileges::ALL_VIEW, ViewDBObjectType}},
 
-  } else if ((privs.compare("CREATE TABLE") == 0) &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::CREATE_TABLE, TableDBObjectType};
-  } else if ((privs.compare("CREATE") == 0) && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::CREATE_TABLE, TableDBObjectType};
-  } else if (privs.compare("SELECT") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::SELECT_FROM_TABLE, TableDBObjectType};
-  } else if (privs.compare("INSERT") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::INSERT_INTO_TABLE, TableDBObjectType};
-  } else if (privs.compare("TRUNCATE") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::TRUNCATE_TABLE, TableDBObjectType};
-  } else if (privs.compare("UPDATE") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::UPDATE_IN_TABLE, TableDBObjectType};
-  } else if (privs.compare("DELETE") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::DELETE_FROM_TABLE, TableDBObjectType};
-  } else if (privs.compare("DROP") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::DROP_TABLE, TableDBObjectType};
+          {{"CREATE TABLE"s, DatabaseDBObjectType},
+           {AccessPrivileges::CREATE_TABLE, TableDBObjectType}},
+          {{"CREATE"s, DatabaseDBObjectType},
+           {AccessPrivileges::CREATE_TABLE, TableDBObjectType}},
+          {{"SELECT"s, DatabaseDBObjectType},
+           {AccessPrivileges::SELECT_FROM_TABLE, TableDBObjectType}},
+          {{"INSERT"s, DatabaseDBObjectType},
+           {AccessPrivileges::INSERT_INTO_TABLE, TableDBObjectType}},
+          {{"TRUNCATE"s, DatabaseDBObjectType},
+           {AccessPrivileges::TRUNCATE_TABLE, TableDBObjectType}},
+          {{"UPDATE"s, DatabaseDBObjectType},
+           {AccessPrivileges::UPDATE_IN_TABLE, TableDBObjectType}},
+          {{"DELETE"s, DatabaseDBObjectType},
+           {AccessPrivileges::DELETE_FROM_TABLE, TableDBObjectType}},
+          {{"DROP"s, DatabaseDBObjectType},
+           {AccessPrivileges::DROP_TABLE, TableDBObjectType}},
+          {{"ALTER"s, DatabaseDBObjectType},
+           {AccessPrivileges::ALTER_TABLE, TableDBObjectType}},
 
-  } else if (privs.compare("SELECT") == 0 && (objectType == TableDBObjectType)) {
-    return {AccessPrivileges::SELECT_FROM_TABLE, TableDBObjectType};
-  } else if (privs.compare("INSERT") == 0 && (objectType == TableDBObjectType)) {
-    return {AccessPrivileges::INSERT_INTO_TABLE, TableDBObjectType};
-  } else if (privs.compare("TRUNCATE") == 0 && (objectType == TableDBObjectType)) {
-    return {AccessPrivileges::TRUNCATE_TABLE, TableDBObjectType};
-  } else if (privs.compare("UPDATE") == 0 && (objectType == TableDBObjectType)) {
-    return {AccessPrivileges::UPDATE_IN_TABLE, TableDBObjectType};
-  } else if (privs.compare("DELETE") == 0 && (objectType == TableDBObjectType)) {
-    return {AccessPrivileges::DELETE_FROM_TABLE, TableDBObjectType};
-  } else if (privs.compare("DROP") == 0 && (objectType == TableDBObjectType)) {
-    return {AccessPrivileges::DROP_TABLE, TableDBObjectType};
+          {{"SELECT"s, TableDBObjectType},
+           {AccessPrivileges::SELECT_FROM_TABLE, TableDBObjectType}},
+          {{"INSERT"s, TableDBObjectType},
+           {AccessPrivileges::INSERT_INTO_TABLE, TableDBObjectType}},
+          {{"TRUNCATE"s, TableDBObjectType},
+           {AccessPrivileges::TRUNCATE_TABLE, TableDBObjectType}},
+          {{"UPDATE"s, TableDBObjectType},
+           {AccessPrivileges::UPDATE_IN_TABLE, TableDBObjectType}},
+          {{"DELETE"s, TableDBObjectType},
+           {AccessPrivileges::DELETE_FROM_TABLE, TableDBObjectType}},
+          {{"DROP"s, TableDBObjectType},
+           {AccessPrivileges::DROP_TABLE, TableDBObjectType}},
+          {{"ALTER"s, TableDBObjectType},
+           {AccessPrivileges::ALTER_TABLE, TableDBObjectType}},
 
-  } else if ((privs.compare("CREATE VIEW") == 0) &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::CREATE_VIEW, ViewDBObjectType};
-  } else if (privs.compare("SELECT VIEW") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::SELECT_FROM_VIEW, ViewDBObjectType};
-  } else if (privs.compare("DROP VIEW") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::DROP_VIEW, ViewDBObjectType};
-  } else if (privs.compare("SELECT") == 0 && (objectType == ViewDBObjectType)) {
-    return {AccessPrivileges::SELECT_FROM_VIEW, ViewDBObjectType};
-  } else if (privs.compare("DROP") == 0 && (objectType == ViewDBObjectType)) {
-    return {AccessPrivileges::DROP_VIEW, ViewDBObjectType};
+          {{"CREATE VIEW"s, DatabaseDBObjectType},
+           {AccessPrivileges::CREATE_VIEW, ViewDBObjectType}},
+          {{"SELECT VIEW"s, DatabaseDBObjectType},
+           {AccessPrivileges::UPDATE_IN_TABLE, ViewDBObjectType}},
+          {{"DROP VIEW"s, DatabaseDBObjectType},
+           {AccessPrivileges::DROP_VIEW, ViewDBObjectType}},
+          {{"SELECT"s, ViewDBObjectType},
+           {AccessPrivileges::SELECT_FROM_VIEW, ViewDBObjectType}},
+          {{"DROP"s, ViewDBObjectType}, {AccessPrivileges::DROP_VIEW, ViewDBObjectType}},
 
-  } else if (privs.compare("CREATE DASHBOARD") == 0 &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::CREATE_DASHBOARD, DashboardDBObjectType};
-  } else if (privs.compare("EDIT DASHBOARD") == 0 &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::EDIT_DASHBOARD, DashboardDBObjectType};
-  } else if (privs.compare("VIEW DASHBOARD") == 0 &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::VIEW_DASHBOARD, DashboardDBObjectType};
-  } else if (privs.compare("DELETE DASHBOARD") == 0 &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::DELETE_DASHBOARD, DashboardDBObjectType};
-  } else if (privs.compare("VIEW") == 0 && (objectType == DashboardDBObjectType)) {
-    return {AccessPrivileges::VIEW_DASHBOARD, DashboardDBObjectType};
-  } else if (privs.compare("EDIT") == 0 && (objectType == DashboardDBObjectType)) {
-    return {AccessPrivileges::EDIT_DASHBOARD, DashboardDBObjectType};
-  } else if (privs.compare("DELETE") == 0 && (objectType == DashboardDBObjectType)) {
-    return {AccessPrivileges::DELETE_DASHBOARD, DashboardDBObjectType};
+          {{"CREATE DASHBOARD"s, DatabaseDBObjectType},
+           {AccessPrivileges::CREATE_DASHBOARD, DashboardDBObjectType}},
+          {{"EDIT DASHBOARD"s, DatabaseDBObjectType},
+           {AccessPrivileges::EDIT_DASHBOARD, DashboardDBObjectType}},
+          {{"VIEW DASHBOARD"s, DatabaseDBObjectType},
+           {AccessPrivileges::VIEW_DASHBOARD, DashboardDBObjectType}},
+          {{"DELETE DASHBOARD"s, DatabaseDBObjectType},
+           {AccessPrivileges::DELETE_DASHBOARD, DashboardDBObjectType}},
+          {{"VIEW"s, DashboardDBObjectType},
+           {AccessPrivileges::VIEW_DASHBOARD, DashboardDBObjectType}},
+          {{"EDIT"s, DashboardDBObjectType},
+           {AccessPrivileges::EDIT_DASHBOARD, DashboardDBObjectType}},
+          {{"DELETE"s, DashboardDBObjectType},
+           {AccessPrivileges::DELETE_DASHBOARD, DashboardDBObjectType}},
 
-  } else if (privs.compare("VIEW SQL EDITOR") == 0 &&
-             (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::VIEW_SQL_EDITOR, DatabaseDBObjectType};
-  } else if (privs.compare("ACCESS") == 0 && (objectType == DatabaseDBObjectType)) {
-    return {AccessPrivileges::ACCESS, DatabaseDBObjectType};
+          {{"VIEW SQL EDITOR"s, DatabaseDBObjectType},
+           {AccessPrivileges::VIEW_SQL_EDITOR, DatabaseDBObjectType}},
+          {{"ACCESS"s, DatabaseDBObjectType},
+           {AccessPrivileges::ACCESS, DatabaseDBObjectType}}};
+
+  auto result = privileges_lookup.find(std::make_pair(privs, objectType));
+  if (result == privileges_lookup.end()) {
+    throw std::runtime_error("Privileges " + privs + " on DB object " + object_name +
+                             " are not correct.");
   }
-
-  throw std::runtime_error("Privileges " + privs + " on DB object " + object_name +
-                           " are not correct.");
-
-  return {AccessPrivileges::NONE, DatabaseDBObjectType};
+  return result->second;
 }
 
 static DBObject createObject(const std::string& objectName, DBObjectType objectType) {
@@ -3543,9 +3605,9 @@ static DBObject createObject(const std::string& objectName, DBObjectType objectT
 // GRANT SELECT/INSERT/CREATE ON TABLE payroll_table TO payroll_dept_role;
 void GrantPrivilegesStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   if (!SysCatalog::instance().arePrivilegesOn()) {
-    throw std::runtime_error("GRANT " + get_priv() +
-                             " failed. This command may be executed only when DB object "
-                             "level access privileges check turned on.");
+    throw std::runtime_error(
+        "GRANT failed. This command may be executed only when DB object "
+        "level access privileges check turned on.");
   }
   auto& catalog = session.get_catalog();
   const auto& currentUser = session.get_currentUser();
@@ -3558,26 +3620,26 @@ void GrantPrivilegesStmt::execute(const Catalog_Namespace::SessionInfo& session)
   if (!currentUser.isSuper) {
     if (!SysCatalog::instance().verifyDBObjectOwnership(currentUser, dbObject, catalog)) {
       throw std::runtime_error(
-          "GRANT " + get_priv() +
-          " failed. It can only be executed by super user or owner of the object.");
+          "GRANT failed. It can only be executed by super user or owner of the object.");
     }
   }
   /* set proper values of privileges & grant them to the object */
-  std::pair<AccessPrivileges, DBObjectType> privs = parseStringPrivs(
-      boost::to_upper_copy<std::string>(get_priv()), objectType, get_object());
-
-  dbObject.setPrivileges(privs.first);
-  dbObject.setPermissionType(privs.second);
-
-  SysCatalog::instance().grantDBObjectPrivileges(get_role(), dbObject, catalog);
+  std::vector<DBObject> objects(get_privs().size(), dbObject);
+  for (size_t i = 0; i < get_privs().size(); ++i) {
+    std::pair<AccessPrivileges, DBObjectType> priv = parseStringPrivs(
+        boost::to_upper_copy<std::string>(get_privs()[i]), objectType, get_object());
+    objects[i].setPrivileges(priv.first);
+    objects[i].setPermissionType(priv.second);
+  }
+  SysCatalog::instance().grantDBObjectPrivilegesBatch(grantees, objects, catalog);
 }
 
 // REVOKE SELECT/INSERT/CREATE ON TABLE payroll_table FROM payroll_dept_role;
 void RevokePrivilegesStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   if (!SysCatalog::instance().arePrivilegesOn()) {
-    throw std::runtime_error("REVOKE " + get_priv() +
-                             " failed. This command may be executed only when DB object "
-                             "level access privileges check turned on.");
+    throw std::runtime_error(
+        "REVOKE failed. This command may be executed only when DB object "
+        "level access privileges check turned on.");
   }
   auto& catalog = session.get_catalog();
   const auto& currentUser = session.get_currentUser();
@@ -3590,20 +3652,21 @@ void RevokePrivilegesStmt::execute(const Catalog_Namespace::SessionInfo& session
   if (!currentUser.isSuper) {
     if (!SysCatalog::instance().verifyDBObjectOwnership(currentUser, dbObject, catalog)) {
       throw std::runtime_error(
-          "REVOKE " + get_priv() +
-          " failed. It can only be executed by super user or owner of the object.");
+          "REVOKE failed. It can only be executed by super user or owner of the object.");
     }
   }
-  /* set proper values of privileges & revoke them from the object */
-  std::pair<AccessPrivileges, DBObjectType> privs = parseStringPrivs(
-      boost::to_upper_copy<std::string>(get_priv()), objectType, get_object());
-
-  dbObject.setPrivileges(privs.first);
-  dbObject.setPermissionType(privs.second);
-
-  SysCatalog::instance().revokeDBObjectPrivileges(get_role(), dbObject, catalog);
+  /* set proper values of privileges & grant them to the object */
+  std::vector<DBObject> objects(get_privs().size(), dbObject);
+  for (size_t i = 0; i < get_privs().size(); ++i) {
+    std::pair<AccessPrivileges, DBObjectType> priv = parseStringPrivs(
+        boost::to_upper_copy<std::string>(get_privs()[i]), objectType, get_object());
+    objects[i].setPrivileges(priv.first);
+    objects[i].setPermissionType(priv.second);
+  }
+  SysCatalog::instance().revokeDBObjectPrivilegesBatch(grantees, objects, catalog);
 }
 
+// NOTE: not used currently, will we ever use it?
 // SHOW ON TABLE payroll_table FOR payroll_dept_role;
 void ShowPrivilegesStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   if (!SysCatalog::instance().arePrivilegesOn()) {
@@ -3704,50 +3767,43 @@ void ShowPrivilegesStmt::execute(const Catalog_Namespace::SessionInfo& session) 
 // GRANT payroll_dept_role TO joe;
 void GrantRoleStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   if (!SysCatalog::instance().arePrivilegesOn()) {
-    throw std::runtime_error("GRANT " + get_role() + " TO " + get_user() +
-                             " failed. This command may be executed only when DB object "
-                             "level access privileges check turned on.");
+    throw std::runtime_error(
+        "GRANT failed. This command may be executed only when DB object "
+        "level access privileges check turned on.");
   }
   const auto& currentUser = session.get_currentUser();
   if (!currentUser.isSuper) {
-    throw std::runtime_error("GRANT " + get_role() + " TO " + get_user() +
-                             "; failed, because it can only be executed by super user.");
-  }
-  if (!get_user().compare(MAPD_ROOT_USER)) {
     throw std::runtime_error(
-        "Request to grant role " + get_role() +
-        " failed because mapd root user has all privileges by default.");
+        "GRANT failed, because it can only be executed by super user.");
   }
-  Catalog_Namespace::UserMetadata user;
-  Role* rl = SysCatalog::instance().getMetadataForRole(get_role());
-  if (!rl || SysCatalog::instance().getMetadataForUser(get_role(), user)) {
-    // check role is userRole
-    // reason for placing the check here instead of Catalog.cpp is to
-    // bypass grantRole_unsafe when createUser statement is kicked off.
-    throw std::runtime_error("Request to grant role " + get_role() +
-                             " failed because role does not exist.");
+  if (std::find(get_grantees().begin(), get_grantees().end(), MAPD_ROOT_USER) !=
+      get_grantees().end()) {
+    throw std::runtime_error(
+        "Request to grant role failed because mapd root user has all privileges by "
+        "default.");
   }
-  SysCatalog::instance().grantRole(get_role(), get_user());
+  SysCatalog::instance().grantRoleBatch(get_roles(), get_grantees());
 }
 
-// REVOKE payroll_dept_role FROM joe;
+// REVOKE payroll_dept_role FROM joe;get_users
 void RevokeRoleStmt::execute(const Catalog_Namespace::SessionInfo& session) {
   if (!SysCatalog::instance().arePrivilegesOn()) {
-    throw std::runtime_error("REVOKE " + get_role() + " FROM " + get_user() +
-                             " failed. This command may be executed only when DB object "
-                             "level access privileges check turned on.");
+    throw std::runtime_error(
+        "REVOKE failed. This command may be executed only when DB object "
+        "level access privileges check turned on.");
   }
   const auto& currentUser = session.get_currentUser();
   if (!currentUser.isSuper) {
-    throw std::runtime_error("REVOKE " + get_role() + " FROM " + get_user() +
-                             "; failed, because it can only be executed by super user.");
-  }
-  if (!get_user().compare(MAPD_ROOT_USER)) {
     throw std::runtime_error(
-        "Request to revoke role " + get_role() +
-        " failed because privileges can not be revoked from mapd root user.");
+        "REVOKE failed, because it can only be executed by super user.");
   }
-  SysCatalog::instance().revokeRole(get_role(), get_user());
+  if (std::find(get_grantees().begin(), get_grantees().end(), MAPD_ROOT_USER) !=
+      get_grantees().end()) {
+    throw std::runtime_error(
+        "Request to revoke role failed because privileges can not be revoked from mapd "
+        "root user.");
+  }
+  SysCatalog::instance().revokeRoleBatch(get_roles(), get_grantees());
 }
 
 using dbl = std::numeric_limits<double>;

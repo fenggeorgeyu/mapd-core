@@ -24,9 +24,9 @@ public class MapDDatabaseMetaDataTest {
 
   static final ArrayList<String> default_tables = new ArrayList<String>() {
     {
-      add("mapd_states");
-      add("mapd_counties");
-      add("mapd_countries");
+      add("omnisci_states");
+      add("omnisci_counties");
+      add("omnisci_countries");
     }
   };
 
@@ -88,8 +88,10 @@ public class MapDDatabaseMetaDataTest {
   public void setUp() throws Exception {
     // Class.forName("org.postgresql.Driver");
     m_super_conn = DriverManager.getConnection(default_url, super_user, super_password);
-    // m_base_conn = DriverManager.getConnection(user_url, base_user, base_password);
+    // m_base_conn = DriverManager.getConnection(user_url, base_user,
+    // base_password);
   }
+
   @After
   public void tearDown() throws Exception {
     m_super_conn.close();
@@ -179,6 +181,7 @@ public class MapDDatabaseMetaDataTest {
       String xx = rS.toString();
     }
   }
+
   class QueryStruct {
     public String D;
     public String S;
@@ -370,113 +373,59 @@ public void getTablePrivileges(
 }
 
 /*
-    @Test
-    public void allProceduresAreCallable() {
-    }
-
-    @Test
-    public void allTablesAreSelectable() {
-    }
-
-    @Test
-    public void getURL() {
-    }
-
-    @Test
-    public void getUserName() {
-    }
-
-    @Test
-    public void isReadOnly() {
-    }
-
-    @Test
-    public void nullsAreSortedHigh() {
-    }
-
-    @Test
-    public void nullsAreSortedLow() {
-    }
-
-    @Test
-    public void nullsAreSortedAtStart() {
-    }
-
-    @Test
-    public void nullsAreSortedAtEnd() {
-    }
-
-    @Test
-    public void getDatabaseProductName() {
-    }
-
-    @Test
-    public void getDriverName() {
-    }
-
-    @Test
-    public void getDriverVersion() {
-    }
-
-    @Test
-    public void getDriverMajorVersion() {
-    }
-
-    @Test
-    public void getDriverMinorVersion() {
-    }
-
-    @Test
-    public void getNumericFunctions() {
-    }
-
-    @Test
-    public void getStringFunctions() {
-    }
-
-    @Test
-    public void getSystemFunctions() {
-    }
-
-    @Test
-    public void getTimeDateFunctions() {
-    }
-
-    @Test
-    public void getSearchStringEscape() {
-    }
-
-    @Test
-    public void getSchemaTerm() {
-    }
-
-    @Test
-    public void getProcedureTerm() {
-    }
-
-    @Test
-    public void getCatalogTerm() {
-    }
-
-    @Test
-    public void getTables() {
-    }
-
-    @Test
-    public void getSchemas() {
-    }
-
-    @Test
-    public void getCatalogs() {
-    }
-
-    @Test
-    public void getTableTypes() {
-    }
-
-    @Test
-    public void getColumns() {
-    }
-
-    */
+ * @Test public void allProceduresAreCallable() { }
+ *
+ * @Test public void allTablesAreSelectable() { }
+ *
+ * @Test public void getURL() { }
+ *
+ * @Test public void getUserName() { }
+ *
+ * @Test public void isReadOnly() { }
+ *
+ * @Test public void nullsAreSortedHigh() { }
+ *
+ * @Test public void nullsAreSortedLow() { }
+ *
+ * @Test public void nullsAreSortedAtStart() { }
+ *
+ * @Test public void nullsAreSortedAtEnd() { }
+ *
+ * @Test public void getDatabaseProductName() { }
+ *
+ * @Test public void getDriverName() { }
+ *
+ * @Test public void getDriverVersion() { }
+ *
+ * @Test public void getDriverMajorVersion() { }
+ *
+ * @Test public void getDriverMinorVersion() { }
+ *
+ * @Test public void getNumericFunctions() { }
+ *
+ * @Test public void getStringFunctions() { }
+ *
+ * @Test public void getSystemFunctions() { }
+ *
+ * @Test public void getTimeDateFunctions() { }
+ *
+ * @Test public void getSearchStringEscape() { }
+ *
+ * @Test public void getSchemaTerm() { }
+ *
+ * @Test public void getProcedureTerm() { }
+ *
+ * @Test public void getCatalogTerm() { }
+ *
+ * @Test public void getTables() { }
+ *
+ * @Test public void getSchemas() { }
+ *
+ * @Test public void getCatalogs() { }
+ *
+ * @Test public void getTableTypes() { }
+ *
+ * @Test public void getColumns() { }
+ *
+ */
 }

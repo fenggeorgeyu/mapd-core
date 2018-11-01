@@ -43,6 +43,7 @@ using namespace std;
 using namespace TestHelpers;
 
 extern bool g_aggregator;
+extern bool g_multi_subquery_exc;
 
 extern int g_test_against_columnId_gap;
 extern bool g_enable_smem_group_by;
@@ -53,12 +54,14 @@ std::unique_ptr<Catalog_Namespace::SessionInfo> g_session;
 std::unique_ptr<QueryRunner::IROutputFile> g_ir_output_file;
 bool g_hoist_literals{true};
 size_t g_shard_count{0};
+bool g_use_row_iterator{true};
+size_t g_num_leafs{1};
 
 size_t choose_shard_count() {
   CHECK(g_session);
   const auto cuda_mgr = g_session->get_catalog().get_dataMgr().cudaMgr_;
   const int device_count = cuda_mgr ? cuda_mgr->getDeviceCount() : 0;
-  return device_count > 1 ? device_count : 0;
+  return g_num_leafs * (device_count > 1 ? device_count : 0);
 }
 
 struct ShardInfo {
@@ -94,7 +97,8 @@ std::string build_create_table_statement(
 
   std::ostringstream with_statement_assembly;
   if (!shard_info.shard_col.empty()) {
-    with_statement_assembly << "shard_count=" << shard_info.shard_count << ", ";
+    with_statement_assembly << "shard_count=" << shard_info.shard_count * g_num_leafs
+                            << ", ";
   }
   with_statement_assembly << "fragment_size=" << fragment_size;
 
@@ -174,8 +178,8 @@ bool approx_eq(const double v, const double target, const double eps = 0.01) {
   return v_u64 == target_u64 || (target - eps < v && v < target + eps);
 }
 
-int parse_fractional_seconds(std::string sfrac, SQLTypeInfo& mapd_ti) {
-  return TimeGM::instance().parse_fractional_seconds(sfrac, mapd_ti);
+int parse_fractional_seconds(uint sfrac, int ntotal, SQLTypeInfo& ti) {
+  return TimeGM::instance().parse_fractional_seconds(sfrac, ntotal, ti);
 }
 
 class SQLiteComparator {
@@ -230,8 +234,10 @@ class SQLiteComparator {
     }
     CHECK_EQ(connector_.getNumCols(), mapd_results->colCount());
     const int num_cols{static_cast<int>(connector_.getNumCols())};
+    auto row_iterator = mapd_results->rowIterator(true, true);
     for (int row_idx = 0; row_idx < num_rows; ++row_idx) {
-      const auto crt_row = mapd_results->getNextRow(true, true);
+      const auto crt_row =
+          g_use_row_iterator ? *row_iterator++ : mapd_results->getNextRow(true, true);
       CHECK(!crt_row.empty());
       CHECK_EQ(static_cast<size_t>(num_cols), crt_row.size());
       for (int col_idx = 0; col_idx < num_cols; ++col_idx) {
@@ -331,9 +337,13 @@ class SQLiteComparator {
                 ASSERT_EQ(ref_val.size(), static_cast<size_t>(end_str - ref_val.c_str()));
               }
               if (dimen > 0 && mapd_type == kTIMESTAMP) {
+                int fs = 0;
                 if (*end_str == '.') {
                   end_str++;
-                  int fs = parse_fractional_seconds(std::string(end_str), mapd_ti);
+                  uint frac_num;
+                  int ntotal;
+                  sscanf(end_str, "%d%n", &frac_num, &ntotal);
+                  fs = parse_fractional_seconds(frac_num, ntotal, mapd_ti);
                   nsec = timegm(&tm_struct) * pow(10, dimen);
                   nsec += fs;
                 } else if (*end_str == '\0') {
@@ -3127,6 +3137,7 @@ TEST(Select, Time) {
         std::make_tuple("nanosecond, m", 1418509395L, 15),
         std::make_tuple("microsecond, m", 1418509395L, 15),
         std::make_tuple("millisecond, m", 1418509395L, 15),
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
         /* TIMESTAMP(3) */
         std::make_tuple("year, m_3", 1388534400000L, 20),
         std::make_tuple("month, m_3", 1417392000000L, 20),
@@ -3170,7 +3181,9 @@ TEST(Select, Time) {
         std::make_tuple("week, m_9", 1145750400000000000L, 10),
         std::make_tuple("nanosecond, m_9", 1146023344607435125L, 10),
         std::make_tuple("microsecond, m_9", 1146023344607435000L, 10),
-        std::make_tuple("millisecond, m_9", 1146023344607000000L, 10)};
+        std::make_tuple("millisecond, m_9", 1146023344607000000L, 10)
+#endif
+    };
     for (auto& query : date_trunc_queries) {
       const auto one_row = run_multiple_agg(
           "SELECT date_trunc(" + std::get<0>(query) +
@@ -3792,12 +3805,18 @@ namespace {
 
 const size_t g_array_test_row_count{20};
 
+std::unique_ptr<Importer_NS::Loader> get_loader(const TableDescriptor* td) {
+  auto& cat = g_session->get_catalog();
+  auto loader = std::make_unique<Importer_NS::Loader>(cat, td);
+  return loader;
+}
+
 void import_array_test(const std::string& table_name) {
   CHECK_EQ(size_t(0), g_array_test_row_count % 4);
   auto& cat = g_session->get_catalog();
   const auto td = cat.getMetadataForTable(table_name);
   CHECK(td);
-  auto loader = std::make_unique<Importer_NS::Loader>(cat, td);
+  auto loader = get_loader(td);
   std::vector<std::unique_ptr<Importer_NS::TypedImportBuffer>> import_buffers;
   const auto col_descs =
       cat.getAllColumnMetadataForTable(td->tableId, false, false, false);
@@ -3825,11 +3844,11 @@ void import_array_test(const std::string& table_name) {
             case kBOOLEAN: {
               for (size_t i = 0; i < 3; ++i) {
                 if (row_idx % 2) {
-                  array_elems.push_back("T");
-                  array_elems.push_back("F");
+                  array_elems.emplace_back("T");
+                  array_elems.emplace_back("F");
                 } else {
-                  array_elems.push_back("F");
-                  array_elems.push_back("T");
+                  array_elems.emplace_back("F");
+                  array_elems.emplace_back("T");
                 }
               }
               break;
@@ -3981,6 +4000,42 @@ void import_big_decimal_range_test() {
         "INSERT INTO big_decimal_range_test VALUES(59016609.300000, 1.3);"};
     run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
     g_sqlite_comparator.query(insert_query);
+  }
+}
+
+void import_decimal_compression_test() {
+  const std::string decimal_compression_test(
+      "DROP TABLE IF EXISTS decimal_compression_test;");
+  run_ddl_statement(decimal_compression_test);
+  g_sqlite_comparator.query(decimal_compression_test);
+  run_ddl_statement(
+      "CREATE TABLE decimal_compression_test(big_dec DECIMAL(17, 2), med_dec DECIMAL(9, "
+      "2), small_dec DECIMAL(4, 2)) WITH (fragment_size=2);");
+  g_sqlite_comparator.query(
+      "CREATE TABLE decimal_compression_test(big_dec DECIMAL(17, 2), med_dec DECIMAL(9, "
+      "2), small_dec DECIMAL(4, 2));");
+  {
+    const std::string insert_query{
+        "INSERT INTO decimal_compression_test VALUES(999999999999999.99, 9999999.99, "
+        "99.99);"};
+    run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
+    g_sqlite_comparator.query(insert_query);
+  }
+  {
+    const std::string insert_query{
+        "INSERT INTO decimal_compression_test VALUES(-999999999999999.99, -9999999.99, "
+        "-99.99);"};
+    run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
+    g_sqlite_comparator.query(insert_query);
+  }
+  {
+    const std::string insert_query{
+        "INSERT INTO decimal_compression_test VALUES(12.2382, 12.2382 , 12.2382);"};
+    run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
+    // sqlite does not do automatic rounding
+    const std::string sqlite_insert_query{
+        "INSERT INTO decimal_compression_test VALUES(12.24, 12.24 , 12.24);"};
+    g_sqlite_comparator.query(sqlite_insert_query);
   }
 }
 
@@ -4682,6 +4737,56 @@ TEST(Select, BigDecimalRange) {
   }
 }
 
+TEST(Select, DecimalCompression) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    std::string mapd_sql = "";
+    std::string sqlite_sql = "";
+
+    mapd_sql =
+        "SELECT AVG(big_dec), AVG(med_dec), AVG(small_dec) FROM "
+        "decimal_compression_test;";
+    sqlite_sql =
+        "SELECT 1.0*AVG(big_dec), 1.0*AVG(med_dec), 1.0*AVG(small_dec) FROM "
+        "decimal_compression_test;";
+    c(mapd_sql, sqlite_sql, dt);
+
+    mapd_sql =
+        "SELECT SUM(big_dec), SUM(med_dec), SUM(small_dec) FROM "
+        "decimal_compression_test;";
+    sqlite_sql =
+        "SELECT 1.0*SUM(big_dec), 1.0*SUM(med_dec), 1.0*SUM(small_dec) FROM "
+        "decimal_compression_test;";
+    c(mapd_sql, sqlite_sql, dt);
+
+    mapd_sql =
+        "SELECT MIN(big_dec), MIN(med_dec), MIN(small_dec) FROM "
+        "decimal_compression_test;";
+    sqlite_sql =
+        "SELECT 1.0*MIN(big_dec), 1.0*MIN(med_dec), 1.0*MIN(small_dec) FROM "
+        "decimal_compression_test;";
+    c(mapd_sql, sqlite_sql, dt);
+
+    mapd_sql =
+        "SELECT MAX(big_dec), MAX(med_dec), MAX(small_dec) FROM "
+        "decimal_compression_test;";
+    sqlite_sql =
+        "SELECT 1.0*MAX(big_dec), 1.0*MAX(med_dec), 1.0*MAX(small_dec) FROM "
+        "decimal_compression_test;";
+    c(mapd_sql, sqlite_sql, dt);
+
+    mapd_sql =
+        "SELECT big_dec, COUNT(*) as n, AVG(med_dec) as med_dec_avg, SUM(small_dec) as "
+        "small_dec_sum FROM decimal_compression_test GROUP BY big_dec ORDER BY "
+        "small_dec_sum;";
+    sqlite_sql =
+        "SELECT 1.0*big_dec, COUNT(*) as n, 1.0*AVG(med_dec) as med_dec_avg, "
+        "1.0*SUM(small_dec) as small_dec_sum FROM decimal_compression_test GROUP BY "
+        "big_dec ORDER BY small_dec_sum;";
+    c(mapd_sql, sqlite_sql, dt);
+  }
+}
+
 TEST(Drop, AfterDrop) {
   run_ddl_statement("create table droptest (i1 integer);");
   run_multiple_agg("insert into droptest values(1);", ExecutorDeviceType::CPU);
@@ -4882,12 +4987,10 @@ TEST(Select, Subqueries) {
       "y;",
       dt);
     c("SELECT COUNT(*) FROM test WHERE str IN (SELECT DISTINCT str FROM test);", dt);
-#ifdef ENABLE_JOIN_EXEC
     c("SELECT SUM((x - (SELECT AVG(x) FROM test)) * (x - (SELECT AVG(x) FROM test)) / "
       "((SELECT COUNT(x) FROM test) - "
       "1)) FROM test;",
       dt);
-#endif
     EXPECT_THROW(run_multiple_agg("SELECT * FROM (SELECT * FROM test LIMIT 5);", dt),
                  std::runtime_error);
     EXPECT_THROW(run_simple_agg("SELECT AVG(SELECT x FROM test LIMIT 5) FROM test;", dt),
@@ -4969,14 +5072,14 @@ TEST(Select, Joins_EmptyTable) {
 }
 
 TEST(Select, Joins_ImplicitJoins) {
-  SKIP_ALL_ON_AGGREGATOR();
-
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
     c("SELECT COUNT(*) FROM test, test_inner WHERE test.x = test_inner.x;", dt);
     c("SELECT COUNT(*) FROM test, hash_join_test WHERE test.t = hash_join_test.t;", dt);
     c("SELECT COUNT(*) FROM test, test_inner WHERE test.x < test_inner.x + 1;", dt);
-    c("SELECT COUNT(*) FROM test, test_inner WHERE test.real_str = test_inner.str;", dt);
+    SKIP_ON_AGGREGATOR(
+        c("SELECT COUNT(*) FROM test, test_inner WHERE test.real_str = test_inner.str;",
+          dt));
     c("SELECT test_inner.x, COUNT(*) AS n FROM test, test_inner WHERE test.x = "
       "test_inner.x GROUP BY test_inner.x "
       "ORDER BY n;",
@@ -5004,16 +5107,22 @@ TEST(Select, Joins_ImplicitJoins) {
     c("SELECT a.x, b.str FROM test a, join_test b WHERE a.str = b.str ORDER BY a.x, "
       "b.str;",
       dt);
-    c("SELECT COUNT(1) FROM test a, join_test b, test_inner c WHERE a.str = b.str AND "
-      "b.x = c.x",
-      dt);
-    c("SELECT COUNT(*) FROM test a, join_test b, test_inner c WHERE a.x = b.x AND a.y = "
-      "b.x AND a.x = c.x AND c.str = "
-      "'foo';",
-      dt);
-    c("SELECT COUNT(*) FROM test a, test b WHERE a.x = b.x AND a.y = b.y;", dt);
-    c("SELECT SUM(b.y) FROM test a, test b WHERE a.x = b.x AND a.y = b.y;", dt);
-    c("SELECT COUNT(*) FROM test a, test b WHERE a.x = b.x AND a.str = b.str;", dt);
+    SKIP_ON_AGGREGATOR(c(
+        "SELECT COUNT(1) FROM test a, join_test b, test_inner c WHERE a.str = b.str AND "
+        "b.x = c.x",
+        dt));
+    SKIP_ON_AGGREGATOR(
+        c("SELECT COUNT(*) FROM test a, join_test b, test_inner c WHERE a.x = b.x AND "
+          "a.y = "
+          "b.x AND a.x = c.x AND c.str = "
+          "'foo';",
+          dt));
+    SKIP_ON_AGGREGATOR(
+        c("SELECT COUNT(*) FROM test a, test b WHERE a.x = b.x AND a.y = b.y;", dt));
+    SKIP_ON_AGGREGATOR(
+        c("SELECT SUM(b.y) FROM test a, test b WHERE a.x = b.x AND a.y = b.y;", dt));
+    SKIP_ON_AGGREGATOR(
+        c("SELECT COUNT(*) FROM test a, test b WHERE a.x = b.x AND a.str = b.str;", dt));
     c("SELECT COUNT(*) FROM test, test_inner WHERE (test.x = test_inner.x AND test.y = "
       "42 AND test_inner.str = 'foo') "
       "OR (test.x = test_inner.x AND test.y = 43 AND test_inner.str = 'foo');",
@@ -5021,20 +5130,22 @@ TEST(Select, Joins_ImplicitJoins) {
     c("SELECT COUNT(*) FROM test, test_inner WHERE test.x = test_inner.x OR test.x = "
       "test_inner.x;",
       dt);
-    c("SELECT bar.str FROM test, bar WHERE test.str = bar.str;", dt);
-    ASSERT_EQ(
+    SKIP_ON_AGGREGATOR(c("SELECT bar.str FROM test, bar WHERE test.str = bar.str;", dt));
+    SKIP_ON_AGGREGATOR(ASSERT_EQ(
         int64_t(3),
         v<int64_t>(run_simple_agg(
             "SELECT COUNT(*) FROM test, join_test WHERE test.rowid = join_test.rowid;",
-            dt)));
-    ASSERT_EQ(7,
-              v<int64_t>(run_simple_agg("SELECT test.x FROM test, test_inner WHERE "
-                                        "test.x = test_inner.x AND test.rowid = 9;",
-                                        dt)));
-    ASSERT_EQ(0,
-              v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM test, test_inner WHERE "
-                                        "test.x = test_inner.x AND test.rowid = 20;",
-                                        dt)));
+            dt))));
+    SKIP_ON_AGGREGATOR(
+        ASSERT_EQ(7,
+                  v<int64_t>(run_simple_agg("SELECT test.x FROM test, test_inner WHERE "
+                                            "test.x = test_inner.x AND test.rowid = 9;",
+                                            dt))));
+    SKIP_ON_AGGREGATOR(
+        ASSERT_EQ(0,
+                  v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM test, test_inner WHERE "
+                                            "test.x = test_inner.x AND test.rowid = 20;",
+                                            dt))));
   }
 }
 
@@ -5108,7 +5219,6 @@ TEST(Select, Joins_InnerJoin_TwoTables) {
     c("SELECT a.x FROM test a JOIN join_test b ON a.str = b.dup_str ORDER BY a.x;", dt);
     SKIP_ON_AGGREGATOR(
         c("SELECT a.x FROM test_inner_x a JOIN test_x b ON a.x = b.x ORDER BY a.x;", dt));
-
     c("SELECT a.x FROM test a JOIN join_test b ON a.str = b.dup_str GROUP BY a.x ORDER "
       "BY a.x;",
       dt);
@@ -5126,7 +5236,6 @@ TEST(Select, Joins_InnerJoin_TwoTables) {
       "(test.str IS NULL AND "
       "join_test.dup_str IS NULL));",
       dt);
-
     SKIP_ON_AGGREGATOR(
         c("SELECT t1.fixed_null_str FROM (SELECT fixed_null_str, SUM(x) n1 FROM test "
           "GROUP BY fixed_null_str) t1 INNER "
@@ -5138,73 +5247,10 @@ TEST(Select, Joins_InnerJoin_TwoTables) {
   }
 }
 
-int create_sharded_join_table(const std::string& table_name,
-                              size_t fragment_size,
-                              size_t num_rows,
-                              const ShardInfo& shard_info,
-                              bool with_delete_support = true) {
-  std::string columns_definition{"i INTEGER, j INTEGER, s TEXT ENCODING DICT(32)"};
-
-  try {
-    std::string drop_ddl{"DROP TABLE IF EXISTS " + table_name + ";"};
-    run_ddl_statement(drop_ddl);
-    g_sqlite_comparator.query(drop_ddl);
-
-    const auto create_ddl = build_create_table_statement(columns_definition,
-                                                         table_name,
-                                                         shard_info,
-                                                         {},
-                                                         fragment_size,
-                                                         with_delete_support);
-    run_ddl_statement(create_ddl);
-    g_sqlite_comparator.query("CREATE TABLE " + table_name + "(i int, j int, s text);");
-
-    const std::vector<std::string> alphabet{"a", "b", "c", "d", "e", "f", "g", "h", "i",
-                                            "j", "k", "l", "m", "n", "o", "p", "q", "r",
-                                            "s", "t", "u", "v", "w", "x", "y", "z"};
-    const auto alphabet_sz = alphabet.size();
-
-    int i = 0;
-    int j = num_rows;
-    for (size_t x = 0; x < num_rows; x++) {
-      const std::string insert_query{"INSERT INTO " + table_name + " VALUES(" +
-                                     std::to_string(i) + "," + std::to_string(j) + ",'" +
-                                     alphabet[i % alphabet_sz] + "');"};
-      LOG(INFO) << insert_query;
-      run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
-      g_sqlite_comparator.query(insert_query);
-      i++;
-      j--;
-    }
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "Failed to (re-)create tables for Inner Join sharded test: "
-               << e.what();
-    return -EEXIST;
-  }
-  return 0;
-}
-
 TEST(Select, Joins_InnerJoin_Sharded) {
   SKIP_ALL_ON_AGGREGATOR();
-
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
-
-    size_t num_shards = 1;
-    if (dt == ExecutorDeviceType::GPU && choose_shard_count() > 0) {
-      num_shards = choose_shard_count();
-    }
-    ShardInfo shard_info{"i", num_shards};
-    size_t fragment_size = 2;
-    bool delete_support = false;
-
-    ASSERT_EQ(create_sharded_join_table(
-                  "st1", fragment_size, 10 * num_shards, shard_info, delete_support),
-              0);
-    ASSERT_EQ(
-        create_sharded_join_table(
-            "st2", fragment_size, num_shards * fragment_size, shard_info, delete_support),
-        0);
 
     // Sharded Inner Joins
     c("SELECT st1.i, st2.i FROM st1 INNER JOIN st2 ON st1.i = st2.i ORDER BY st1.i;", dt);
@@ -5257,36 +5303,32 @@ TEST(Select, Joins_InnerJoin_Sharded) {
       "st2.j > 0 and st1.s <> 'foo' "
       "and st2.s <> 'foo' ORDER BY st1.i;",
       dt);
-
-    ASSERT_EQ(create_sharded_join_table(
-                  "st2", fragment_size, 8 * num_shards, shard_info, delete_support),
-              0);
     // Non-sharded inner join (multi frag)
-    c("SELECT st1.i, st2.i FROM st1 INNER JOIN st2 ON st1.j = st2.j ORDER BY st1.i;", dt);
-    c("SELECT st1.j, st2.j FROM st1 INNER JOIN st2 ON st1.j = st2.j ORDER BY st1.i;", dt);
-    c("SELECT st1.j, st2.j FROM st1 INNER JOIN st2 ON st1.j = st2.j WHERE st2.j > -1 "
+    c("SELECT st1.i, st3.i FROM st1 INNER JOIN st3 ON st1.j = st3.j ORDER BY st1.i;", dt);
+    c("SELECT st1.j, st3.j FROM st1 INNER JOIN st3 ON st1.j = st3.j ORDER BY st1.i;", dt);
+    c("SELECT st1.j, st3.j FROM st1 INNER JOIN st3 ON st1.j = st3.j WHERE st3.j > -1 "
       "ORDER BY st1.i;",
       dt);
-    c("SELECT st1.j, st2.j FROM st1 INNER JOIN st2 ON st1.j = st2.j WHERE st2.j > 0 "
+    c("SELECT st1.j, st3.j FROM st1 INNER JOIN st3 ON st1.j = st3.j WHERE st3.j > 0 "
       "ORDER BY st1.i;",
       dt);
-    c("SELECT st1.j, st1.s, st2.j, st2.s FROM st1 INNER JOIN st2 ON st1.j = st2.j WHERE "
-      "st2.j > 0 ORDER BY st1.i;",
+    c("SELECT st1.j, st1.s, st3.j, st3.s FROM st1 INNER JOIN st3 ON st1.j = st3.j WHERE "
+      "st3.j > 0 ORDER BY st1.i;",
       dt);
-    c("SELECT st1.i, st1.j, st1.s, st2.i, st2.s, st2.j FROM st1 INNER JOIN st2 ON st1.j "
-      "= st2.j WHERE st2.i > 0 ORDER "
+    c("SELECT st1.i, st1.j, st1.s, st3.i, st3.s, st3.j FROM st1 INNER JOIN st3 ON st1.j "
+      "= st3.j WHERE st3.i > 0 ORDER "
       "BY st1.i;",
       dt);
-    c("SELECT st1.i, st1.j, st1.s, st2.i, st2.s, st2.j FROM st1 INNER JOIN st2 ON st1.j "
-      "= st2.j WHERE st2.j > 0 ORDER "
+    c("SELECT st1.i, st1.j, st1.s, st3.i, st3.s, st3.j FROM st1 INNER JOIN st3 ON st1.j "
+      "= st3.j WHERE st3.j > 0 ORDER "
       "BY st1.i;",
       dt);
-    c("SELECT st1.j, st1.s, st2.s, st2.j FROM st1 INNER JOIN st2 ON st1.j = st2.j WHERE "
-      "st2.j > 0 ORDER BY st1.i;",
+    c("SELECT st1.j, st1.s, st3.s, st3.j FROM st1 INNER JOIN st3 ON st1.j = st3.j WHERE "
+      "st3.j > 0 ORDER BY st1.i;",
       dt);
-    c("SELECT st1.j, st1.s, st2.s, st2.j FROM st1 INNER JOIN st2 ON st1.j = st2.j WHERE "
-      "st2.j > 0 and st1.s <> 'foo' "
-      "and st2.s <> 'foo' ORDER BY st1.i;",
+    c("SELECT st1.j, st1.s, st3.s, st3.j FROM st1 INNER JOIN st3 ON st1.j = st3.j WHERE "
+      "st3.j > 0 and st1.s <> 'foo' "
+      "and st3.s <> 'foo' ORDER BY st1.i;",
       dt);
   }
 }
@@ -5372,7 +5414,6 @@ TEST(Select, Joins_InnerJoin_AtLeastThreeTables) {
 
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
-#ifdef ENABLE_JOIN_EXEC
     c("SELECT count(*) FROM test AS a JOIN join_test AS b ON a.x = b.x JOIN test_inner "
       "AS c ON b.str = c.str;",
       dt);
@@ -5433,7 +5474,6 @@ TEST(Select, Joins_InnerJoin_AtLeastThreeTables) {
       "join_test c ON b.x = c.x JOIN "
       "test_inner d ON b.x = d.x ORDER BY a.x, b.str;",
       dt);
-#endif
   }
 
   g_enable_watchdog = save_watchdog;
@@ -5877,60 +5917,6 @@ TEST(Select, Joins_MultipleOuterExpressions) {
   }
 }
 
-TEST(Select, Joins_Unsupported) {
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
-    SKIP_NO_GPU();
-#ifndef ENABLE_JOIN_EXEC
-    EXPECT_THROW(run_multiple_agg("SELECT count(*) FROM test AS a JOIN join_test AS b ON "
-                                  "a.x = b.x JOIN test_inner AS c ON "
-                                  "b.str = c.str;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT count(*) FROM test AS a JOIN join_test AS b ON "
-                                  "a.x = b.x JOIN test_inner AS c ON b.str = "
-                                  "c.str JOIN join_test AS d ON c.x = d.x;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT a.x AS x, y, b.str FROM test AS a JOIN "
-                                  "join_test AS b ON a.x = b.x JOIN test_inner AS c "
-                                  "ON b.str = c.str ORDER BY x;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT count(*) FROM test AS a JOIN join_test AS b ON "
-                                  "a.x = b.x JOIN test_inner AS c ON b.str = "
-                                  "c.str WHERE a.y "
-                                  "< 43;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT SUM(a.x), b.str FROM test AS a JOIN join_test "
-                                  "AS b ON a.x = b.x JOIN test_inner AS c ON "
-                                  "b.str = c.str WHERE a.y "
-                                  "= 43 group by b.str;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg(
-                     "SELECT a.str as key0,a.fixed_str as key1,COUNT(*) AS color FROM "
-                     "test a JOIN (select str,count(*) "
-                     "from test group by str order by COUNT(*) desc limit 40) b on "
-                     "a.str=b.str JOIN (select "
-                     "fixed_str,count(*) from test group by fixed_str order by count(*) "
-                     "desc limit 40) c on "
-                     "c.fixed_str=a.fixed_str GROUP BY key0, key1 ORDER BY key0,key1;",
-                     dt),
-                 std::runtime_error);
-    EXPECT_THROW(
-        run_multiple_agg("SELECT x, tnone FROM test LEFT JOIN text_group_by_test ON "
-                         "test.str = text_group_by_test.tdef;",
-                         dt),
-        std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT * FROM test a JOIN test b on a.b = b.x;", dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT * FROM test a JOIN test b on a.f = b.f;", dt),
-                 std::runtime_error);
-#endif
-  }
-}
-
 TEST(Select, RuntimeFunctions) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -6198,6 +6184,7 @@ TEST(Select, WatchdogTest) {
   }
 }
 
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
 TEST(Select, TimestampPrecision) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
@@ -7153,8 +7140,347 @@ TEST(Select, TimestampPrecision) {
     ASSERT_EQ(1418509415323L,
               v<int64_t>(run_simple_agg(
                   "SELECT TIMESTAMPADD(SECOND, 20, m_3) FROM test limit 1;", dt)));
+
+    // Precisions Cast Tests
+    // TODO(Wamsi): Add test for microsecond and nanosecond
+    // once the calcite issue regarding support above milliseconds is resolved
+    // Timestamps
+    ASSERT_EQ(1418509395000,
+              v<int64_t>(run_simple_agg(
+                  "SELECT CAST(m as TIMESTAMP(3)) FROM test limit 1;", dt)));
+    ASSERT_EQ(g_num_rows + g_num_rows,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where CAST(m as TIMESTAMP(3)) < m_3", dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where CAST(m as TIMESTAMP(3)) > m_3;", dt)));
+    ASSERT_EQ(1418509395,
+              v<int64_t>(run_simple_agg(
+                  "SELECT CAST(m_3 as TIMESTAMP(0)) FROM test limit 1;", dt)));
+    ASSERT_EQ(g_num_rows + g_num_rows,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where CAST(m_3 as TIMESTAMP(0)) = m", dt)));
+    ASSERT_EQ(
+        g_num_rows + g_num_rows / 2,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where cast(m as timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(0) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(g_num_rows + g_num_rows / 2,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m as timestamp(3)) between "
+                  "TIMESTAMP(3) '2014-12-12 22:23:15.320' and TIMESTAMP(3) '2014-12-13 "
+                  "22:23:15.323'",
+                  dt)));
+    ASSERT_EQ(
+        g_num_rows + g_num_rows / 2,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where cast(m_3 as timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(3) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(g_num_rows / 2,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m_6 as timestamp(3)) between "
+                  "TIMESTAMP(3) '2014-12-13 22:23:15.870' and TIMESTAMP(3) '2014-12-13 "
+                  "22:23:15.875'",
+                  dt)));
+    ASSERT_EQ(
+        g_num_rows / 2,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where cast(m_6 as timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(3) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(g_num_rows / 2,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m_9 as timestamp(3)) between "
+                  "TIMESTAMP(3) '2014-12-13 22:23:15.607' and TIMESTAMP(3) '2014-12-13 "
+                  "22:23:15.608'",
+                  dt)));
+    ASSERT_EQ(
+        g_num_rows / 2,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where cast(m_9 as timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(0) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(
+        10,
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM test where cast(m_9 as "
+                                  "timestamp(0)) >= TIMESTAMP(0) '2014-12-13 22:23:14';",
+                                  dt)));
+    ASSERT_EQ(
+        10,
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM test where cast(m_9 as "
+                                  "timestamp(0)) <= TIMESTAMP(0) '2014-12-13 22:23:14';",
+                                  dt)));
+    ASSERT_EQ(10,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m_9 as timestamp(3)) > "
+                  "TIMESTAMP(3) '2014-12-13 22:23:14.607';",
+                  dt)));
+    ASSERT_EQ(10,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m_9 as timestamp(3)) < "
+                  "TIMESTAMP(3) '2014-12-13 22:23:14.607';",
+                  dt)));
+    ASSERT_EQ(10,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m_6 as timestamp(3)) >= "
+                  "TIMESTAMP(3) '2014-12-13 22:23:14.607';",
+                  dt)));
+    ASSERT_EQ(10,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(m_6 as timestamp(3)) <= "
+                  "TIMESTAMP(3) '2014-12-13 22:23:14.607';",
+                  dt)));
+    ASSERT_EQ(
+        5,
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM test where cast(m_6 as "
+                                  "timestamp(0)) >= TIMESTAMP(0) '2014-12-14 22:23:14';",
+                                  dt)));
+    ASSERT_EQ(
+        15,
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM test where cast(m_6 as "
+                                  "timestamp(0)) <= TIMESTAMP(0) '2014-12-14 22:23:14';",
+                                  dt)));
+    ASSERT_EQ(5,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM test where m_3 >= "
+                                        "TIMESTAMP(3) '2014-12-13 22:23:15.607';",
+                                        dt)));
+    ASSERT_EQ(15,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM test where m_3 <= "
+                                        "TIMESTAMP(3) '2014-12-13 22:23:15.607';",
+                                        dt)));
+    ASSERT_EQ(
+        20,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where m_3 >= TIMESTAMP(0) '2014-12-14 22:23:14';",
+            dt)));
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where m_3 <= TIMESTAMP(0) '2014-12-14 22:23:14';",
+            dt)));
+    ASSERT_EQ(20,
+              v<int64_t>(run_simple_agg(
+                  "select count(*) from test where cast(m_3 as timestamp(0)) = m;", dt)));
+    ASSERT_EQ(20,
+              v<int64_t>(run_simple_agg("select count(*) from test where m_3 > m;", dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg("select count(*) from test where m_3 = m;", dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg("select count(*) from test where m_3 < m;", dt)));
+    ASSERT_EQ(
+        5, v<int64_t>(run_simple_agg("select count(*) from test where m_6 > m_3;", dt)));
+    ASSERT_EQ(
+        15, v<int64_t>(run_simple_agg("select count(*) from test where m_6 < m_3;", dt)));
+    ASSERT_EQ(
+        0, v<int64_t>(run_simple_agg("select count(*) from test where m_6 = m_3;", dt)));
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select count(*) from test where cast(m_6 as timestamp(3)) = m_3;", dt)));
+    ASSERT_EQ(
+        15, v<int64_t>(run_simple_agg("select count(*) from test where m_9 > m_6;", dt)));
+    ASSERT_EQ(
+        5, v<int64_t>(run_simple_agg("select count(*) from test where m_9 < m_6;", dt)));
+    ASSERT_EQ(
+        0, v<int64_t>(run_simple_agg("select count(*) from test where m_9 = m_6;", dt)));
+    ASSERT_EQ(
+        0,
+        v<int64_t>(run_simple_agg(
+            "select count(*) from test where cast(m_9 as timestamp(3)) = m_3;", dt)));
+    ASSERT_EQ(15,
+              v<int64_t>(run_simple_agg("SELECT count(*) FROM test where m_3 = "
+                                        "TIMESTAMP(3) '2014-12-13 22:23:15.323';",
+                                        dt)));
+    // Dates
+    ASSERT_EQ(
+        g_num_rows + g_num_rows / 2,
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM test where cast(o as timestamp(0)) between "
+            "TIMESTAMP(0) '1999-09-08 22:23:14' and TIMESTAMP(0) '1999-09-09 22:23:15'",
+            dt)));
+    ASSERT_EQ(g_num_rows + g_num_rows / 2,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(o as timestamp(3)) between "
+                  "TIMESTAMP(3) '1999-09-08 12:12:31.500' and TIMESTAMP(3) '1999-09-09 "
+                  "22:23:15'",
+                  dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(o as timestamp(0)) between "
+                  "TIMESTAMP(3) '1999-09-09 12:12:31.500' and TIMESTAMP(3) '1999-09-09 "
+                  "22:23:15.500'",
+                  dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(o as timestamp(3)) between "
+                  "TIMESTAMP(0) '1999-09-09 12:12:31.500' and TIMESTAMP(0) '1999-09-09 "
+                  "22:23:15.500'",
+                  dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(o as timestamp(3)) >= "
+                  "TIMESTAMP(3) '1999-09-09 12:12:31.500'",
+                  dt)));
+    ASSERT_EQ(g_num_rows + g_num_rows / 2,
+              v<int64_t>(
+                  run_simple_agg("SELECT count(*) FROM test where cast(o as "
+                                 "timestamp(3)) < TIMESTAMP(3) '1999-09-09 12:12:31.500'",
+                                 dt)));
+    ASSERT_EQ(g_num_rows + g_num_rows / 2,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(o as timestamp(3)) < m_3", dt)));
+    ASSERT_EQ(0,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM test where cast(o as timestamp(3)) >= m_3", dt)));
+
+    ASSERT_EQ(
+        1418509395000000000,
+        v<int64_t>(run_simple_agg(
+            "SELECT PG_DATE_TRUNC('second', m_9) FROM test where cast(m_9 as "
+            "timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(0) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(
+        1418509395000,
+        v<int64_t>(run_simple_agg(
+            "SELECT PG_DATE_TRUNC('second', m_3) FROM test where cast(m_3 as "
+            "timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(0) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(
+        1418509395000000,
+        v<int64_t>(run_simple_agg(
+            "SELECT PG_DATE_TRUNC('second', m_6) FROM test where cast(m_6 as "
+            "timestamp(0)) between "
+            "TIMESTAMP(0) '2014-12-13 22:23:14' and TIMESTAMP(0) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(
+        1418509395,
+        v<int64_t>(run_simple_agg(
+            "SELECT PG_DATE_TRUNC('second', m) FROM test where cast(m as "
+            "timestamp(3)) between "
+            "TIMESTAMP(3) '2014-12-13 22:23:14' and TIMESTAMP(3) '2014-12-13 22:23:15'",
+            dt)));
+    ASSERT_EQ(1418509395000000000,
+              v<int64_t>(run_simple_agg(
+                  "SELECT PG_DATE_TRUNC('second', m_9) FROM test where cast(m_9 as "
+                  "timestamp(3)) between "
+                  "TIMESTAMP(3) '2014-12-13 22:23:14.323' and TIMESTAMP(3) '2014-12-13 "
+                  "22:23:15.999'",
+                  dt)));
+    ASSERT_EQ(1418509395000000,
+              v<int64_t>(run_simple_agg(
+                  "SELECT PG_DATE_TRUNC('second', m_6) FROM test where cast(m_6 as "
+                  "timestamp(3)) between "
+                  "TIMESTAMP(3) '2014-12-13 22:23:14.323' and TIMESTAMP(3) '2014-12-13 "
+                  "22:23:15.999'",
+                  dt)));
   }
 }
+#endif
+
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
+TEST(Select, TimestampPrecisionFormat) {
+  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
+    SKIP_NO_GPU();
+    run_ddl_statement("DROP TABLE IF EXISTS ts_format;");
+    EXPECT_NO_THROW(
+        run_ddl_statement("CREATE TABLE ts_format (ts_3 TIMESTAMP(3), ts_6 TIMESTAMP(6), "
+                          "ts_9 TIMESTAMP(9));"));
+    EXPECT_NO_THROW(
+        run_multiple_agg("INSERT INTO ts_format VALUES('2012-05-22 01:02:03', "
+                         "'2012-05-22 01:02:03', '2012-05-22 01:02:03');",
+                         dt));
+    EXPECT_NO_THROW(
+        run_multiple_agg("INSERT INTO ts_format VALUES('2012-05-22 01:02:03.', "
+                         "'2012-05-22 01:02:03.', '2012-05-22 01:02:03.');",
+                         dt));
+    EXPECT_NO_THROW(
+        run_multiple_agg("INSERT INTO ts_format VALUES('2012-05-22 01:02:03.0', "
+                         "'2012-05-22 01:02:03.0', '2012-05-22 01:02:03.0');",
+                         dt));
+
+    EXPECT_NO_THROW(
+        run_multiple_agg("INSERT INTO ts_format VALUES('2012-05-22 01:02:03.1', "
+                         "'2012-05-22 01:02:03.1', '2012-05-22 01:02:03.1');",
+                         dt));
+    EXPECT_NO_THROW(
+        run_multiple_agg("INSERT INTO ts_format VALUES('2012-05-22 01:02:03.10', "
+                         "'2012-05-22 01:02:03.10', '2012-05-22 01:02:03.10');",
+                         dt));
+
+    EXPECT_NO_THROW(
+        run_multiple_agg("INSERT INTO ts_format VALUES('2012-05-22 01:02:03.03Z', "
+                         "'2012-05-22 01:02:03.03Z', '2012-05-22 01:02:03.03Z');",
+                         dt));
+    EXPECT_NO_THROW(run_multiple_agg(
+        "INSERT INTO ts_format VALUES('2012-05-22 01:02:03.003046777Z', '2012-05-22 "
+        "01:02:03.000003046777Z', '2012-05-22 01:02:03.000000003046777Z');",
+        dt));
+
+    ASSERT_EQ(3L,
+              v<int64_t>(run_simple_agg("SELECT count(ts_3) FROM ts_format where "
+                                        "extract(epoch from ts_3) = 1337648523000;",
+                                        dt)));
+    ASSERT_EQ(2L,
+              v<int64_t>(run_simple_agg("SELECT count(ts_3) FROM ts_format where "
+                                        "extract(epoch from ts_3) = 1337648523100;",
+                                        dt)));
+    ASSERT_EQ(1L,
+              v<int64_t>(run_simple_agg("SELECT count(ts_3) FROM ts_format where "
+                                        "extract(epoch from ts_3) = 1337648523030;",
+                                        dt)));
+    ASSERT_EQ(1L,
+              v<int64_t>(run_simple_agg("SELECT count(ts_3) FROM ts_format where "
+                                        "extract(epoch from ts_3) = 1337648523003;",
+                                        dt)));
+
+    ASSERT_EQ(3L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_6) FROM ts_format where extract(epoch from ts_6) = "
+                  "1337648523000000;",
+                  dt)));
+    ASSERT_EQ(2L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_6) FROM ts_format where extract(epoch from ts_6) = "
+                  "1337648523100000;",
+                  dt)));
+    ASSERT_EQ(1L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_6) FROM ts_format where extract(epoch from ts_6) = "
+                  "1337648523030000;",
+                  dt)));
+    ASSERT_EQ(1L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_6) FROM ts_format where extract(epoch from ts_6) = "
+                  "1337648523000003;",
+                  dt)));
+
+    ASSERT_EQ(3L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_9) FROM ts_format where extract(epoch from ts_9) = "
+                  "1337648523000000000;",
+                  dt)));
+    ASSERT_EQ(2L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_9) FROM ts_format where extract(epoch from ts_9) = "
+                  "1337648523100000000;",
+                  dt)));
+    ASSERT_EQ(1L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_9) FROM ts_format where extract(epoch from ts_9) = "
+                  "1337648523030000000;",
+                  dt)));
+    ASSERT_EQ(1L,
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(ts_9) FROM ts_format where extract(epoch from ts_9) = "
+                  "1337648523000000003;",
+                  dt)));
+  }
+}
+#endif
 
 TEST(Truncate, Count) {
   run_ddl_statement("create table trunc_test (i1 integer, t1 text);");
@@ -8625,6 +8951,7 @@ TEST(Delete, ShardedTableDeleteTest) {
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
 
+    run_ddl_statement("drop table if exists shardkey;");
     run_ddl_statement(
         "create table shardkey ( x integer, y integer, shard key (x) ) with "
         "(vacuum='delayed', shard_count=4);");
@@ -8796,7 +9123,6 @@ TEST(Delete, Joins_InnerJoin_AtLeastThreeTables) {
 
   for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
     SKIP_NO_GPU();
-#ifdef ENABLE_JOIN_EXEC
     c("SELECT count(*) FROM test AS a JOIN join_test AS b ON a.x = b.x JOIN test_inner "
       "AS c ON b.str = c.str;",
       dt);
@@ -8857,7 +9183,6 @@ TEST(Delete, Joins_InnerJoin_AtLeastThreeTables) {
       "join_test c ON b.x = c.x JOIN "
       "test_inner d ON b.x = d.x ORDER BY a.x, b.str;",
       dt);
-#endif
   }
 
   g_enable_watchdog = save_watchdog;
@@ -9284,66 +9609,6 @@ TEST(Delete, Joins_MultipleOuterExpressions) {
   }
 }
 
-TEST(Delete, Joins_Unsupported) {
-  SKIP_ALL_ON_AGGREGATOR();
-
-  if (std::is_same<CalciteDeletePathSelector, PreprocessorFalse>::value) {
-    return;
-  }
-
-  for (auto dt : {ExecutorDeviceType::CPU, ExecutorDeviceType::GPU}) {
-    SKIP_NO_GPU();
-#ifndef ENABLE_JOIN_EXEC
-    EXPECT_THROW(run_multiple_agg("SELECT count(*) FROM test AS a JOIN join_test AS b ON "
-                                  "a.x = b.x JOIN test_inner AS c ON "
-                                  "b.str = c.str;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT count(*) FROM test AS a JOIN join_test AS b ON "
-                                  "a.x = b.x JOIN test_inner AS c ON b.str = "
-                                  "c.str JOIN join_test AS d ON c.x = d.x;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT a.x AS x, y, b.str FROM test AS a JOIN "
-                                  "join_test AS b ON a.x = b.x JOIN test_inner AS c "
-                                  "ON b.str = c.str ORDER BY x;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT count(*) FROM test AS a JOIN join_test AS b ON "
-                                  "a.x = b.x JOIN test_inner AS c ON b.str = "
-                                  "c.str WHERE a.y "
-                                  "< 43;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT SUM(a.x), b.str FROM test AS a JOIN join_test "
-                                  "AS b ON a.x = b.x JOIN test_inner AS c ON "
-                                  "b.str = c.str WHERE a.y "
-                                  "= 43 group by b.str;",
-                                  dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg(
-                     "SELECT a.str as key0,a.fixed_str as key1,COUNT(*) AS color FROM "
-                     "test a JOIN (select str,count(*) "
-                     "from test group by str order by COUNT(*) desc limit 40) b on "
-                     "a.str=b.str JOIN (select "
-                     "fixed_str,count(*) from test group by fixed_str order by count(*) "
-                     "desc limit 40) c on "
-                     "c.fixed_str=a.fixed_str GROUP BY key0, key1 ORDER BY key0,key1;",
-                     dt),
-                 std::runtime_error);
-    EXPECT_THROW(
-        run_multiple_agg("SELECT x, tnone FROM test LEFT JOIN text_group_by_test ON "
-                         "test.str = text_group_by_test.tdef;",
-                         dt),
-        std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT * FROM test a JOIN test b on a.b = b.x;", dt),
-                 std::runtime_error);
-    EXPECT_THROW(run_multiple_agg("SELECT * FROM test a JOIN test b on a.f = b.f;", dt),
-                 std::runtime_error);
-#endif
-  }
-}
-
 TEST(Delete, ExtraFragment) {
   SKIP_ALL_ON_AGGREGATOR();
 
@@ -9538,6 +9803,16 @@ TEST(Select, GeoSpatial_Basics) {
         v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_test "
                                   "WHERE ST_Distance(p, 'LINESTRING(-1 0, 0 1)') < 2.5;",
                                   dt)));
+
+    // Unsupported aggs
+    EXPECT_THROW(run_simple_agg("SELECT MIN(p) FROM geospatial_test;", dt),
+                 std::runtime_error);
+    EXPECT_THROW(run_simple_agg("SELECT MAX(p) FROM geospatial_test;", dt),
+                 std::runtime_error);
+    EXPECT_THROW(run_simple_agg("SELECT AVG(p) FROM geospatial_test;", dt),
+                 std::runtime_error);
+    EXPECT_THROW(run_simple_agg("SELECT SUM(p) FROM geospatial_test;", dt),
+                 std::runtime_error);
   }
 }
 
@@ -9555,6 +9830,75 @@ TEST(Select, GeoSpatial_Projection) {
     compare_geo_target(
         run_simple_agg("SELECT mpoly FROM geospatial_test WHERE id = 1;", dt),
         GeoMultiPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}, {1}));
+
+    // Sample() version of above
+    SKIP_ON_AGGREGATOR(
+        compare_geo_target(
+            run_simple_agg("SELECT SAMPLE(p) FROM geospatial_test WHERE id = 1;", dt),
+            GeoPointTargetValue({1., 1.}));
+        compare_geo_target(
+            run_simple_agg("SELECT SAMPLE(l) FROM geospatial_test WHERE id = 1;", dt),
+            GeoLineStringTargetValue({1., 0., 2., 2., 3., 3.}));
+        compare_geo_target(
+            run_simple_agg("SELECT SAMPLE(poly) FROM geospatial_test WHERE id = 1;", dt),
+            GeoPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}));
+        compare_geo_target(
+            run_simple_agg("SELECT SAMPLE(mpoly) FROM geospatial_test WHERE id = 1;", dt),
+            GeoMultiPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}, {1})));
+
+    // Sample() version of above with GROUP BY
+    compare_geo_target(
+        run_simple_agg("SELECT SAMPLE(p) FROM geospatial_test WHERE id = 1 GROUP BY id;",
+                       dt),
+        GeoPointTargetValue({1., 1.}));
+    compare_geo_target(
+        run_simple_agg("SELECT SAMPLE(l) FROM geospatial_test WHERE id = 1 GROUP BY id;",
+                       dt),
+        GeoLineStringTargetValue({1., 0., 2., 2., 3., 3.}));
+    compare_geo_target(
+        run_simple_agg(
+            "SELECT SAMPLE(poly) FROM geospatial_test WHERE id = 1 GROUP BY id;", dt),
+        GeoPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}));
+    compare_geo_target(
+        run_simple_agg(
+            "SELECT SAMPLE(mpoly) FROM geospatial_test WHERE id = 1 GROUP BY id;", dt),
+        GeoMultiPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}, {1}));
+
+    // Sample() with compression
+    compare_geo_target(
+        run_simple_agg(
+            "SELECT SAMPLE(gp4326) FROM geospatial_test WHERE id = 1 GROUP BY id;", dt),
+        GeoPointTargetValue({1., 1.}),
+        0.01);
+    compare_geo_target(
+        run_simple_agg(
+            "SELECT SAMPLE(gpoly4326) FROM geospatial_test WHERE id = 1 GROUP BY id;",
+            dt),
+        GeoPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}),
+        0.01);
+
+    // Sample with multiple aggs
+    {
+      const auto rows = run_multiple_agg(
+          "SELECT COUNT(*), SAMPLE(l) FROM geospatial_test WHERE id = 1 GROUP BY id;",
+          dt);
+      rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
+      const auto row = rows->getNextRow(false, false);
+      CHECK_EQ(row.size(), size_t(2));
+      ASSERT_EQ(static_cast<int64_t>(1), v<int64_t>(row[0]));
+      compare_geo_target(row[1], GeoLineStringTargetValue({1., 0., 2., 2., 3., 3.}));
+    }
+    {
+      const auto rows = run_multiple_agg(
+          "SELECT COUNT(*), SAMPLE(poly) FROM geospatial_test WHERE id = 1 GROUP BY id;",
+          dt);
+      rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
+      const auto row = rows->getNextRow(false, false);
+      CHECK_EQ(row.size(), size_t(2));
+      ASSERT_EQ(static_cast<int64_t>(1), v<int64_t>(row[0]));
+      compare_geo_target(row[1], GeoPolyTargetValue({0., 0., 2., 0., 0., 2.}, {3}));
+    }
+
     ASSERT_EQ(
         static_cast<int64_t>(1),
         v<int64_t>(run_simple_agg("SELECT COUNT(*) FROM geospatial_test WHERE "
@@ -9726,13 +10070,97 @@ TEST(Select, GeoSpatial_Projection) {
             "from geospatial_test limit 1;",
             dt)),
         static_cast<double>(0.01));
+    ASSERT_NEAR(
+        static_cast<double>(1.4142),
+        v<double>(run_simple_agg(
+            "SELECT ST_Distance("
+            "'POLYGON((0 0, 4 0, 4 4, 2 5, 0 4, 0 0), (1 1, 1 3, 2 4, 3 3, 3 1, 1 1))', "
+            "'POLYGON((5 5, 8 2, 8 4, 5 5))') "
+            "from geospatial_test limit 1;",
+            dt)),
+        static_cast<double>(0.01));
+    ASSERT_NEAR(
+        static_cast<double>(0.0),
+        v<double>(run_simple_agg(
+            "SELECT ST_Distance("
+            "'POLYGON((0 0, 4 0, 4 4, 2 5, 0 4, 0 0), (1 1, 1 3, 2 4, 3 3, 3 1, 1 1))', "
+            "'POLYGON((3.5 3.5, 8 2, 8 4, 3.5 3.5))') "
+            "from geospatial_test limit 1;",
+            dt)),
+        static_cast<double>(0.01));
+    ASSERT_NEAR(
+        static_cast<double>(0.0),
+        v<double>(run_simple_agg(
+            "SELECT ST_Distance("
+            "'POLYGON((0 0, 4 0, 4 4, 2 5, 0 4, 0 0), (1 1, 1 3, 2 4, 3 3, 3 1, 1 1))', "
+            "'POLYGON((8 2, 8 4, 2 2, 8 2))') "
+            "from geospatial_test limit 1;",
+            dt)),
+        static_cast<double>(0.01));
     ASSERT_NEAR(static_cast<double>(2.0),
                 v<double>(run_simple_agg("SELECT ST_Distance("
-                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2), "
-                                         "(1 1, -1 1, -1 -1, 1 -1, 1 1)))', "
+                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2)), "
+                                         "((1 1, -1 1, -1 -1, 1 -1, 1 1)))', "
                                          "'POINT(4 2)') "
                                          "from geospatial_test limit 1;",
                                          dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(2.0),
+                v<double>(run_simple_agg("SELECT ST_Distance("
+                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2)), "
+                                         "((1 1, -1 1, -1 -1, 1 -1, 1 1)))', "
+                                         "'LINESTRING(4 2, 5 3)') "
+                                         "from geospatial_test limit 1;",
+                                         dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(2.0),
+                v<double>(run_simple_agg("SELECT ST_Distance("
+                                         "'LINESTRING(4 2, 5 3)', "
+                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2)), "
+                                         "((1 1, -1 1, -1 -1, 1 -1, 1 1)))') "
+                                         "from geospatial_test limit 1;",
+                                         dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(2.0),
+                v<double>(run_simple_agg("SELECT ST_Distance("
+                                         "'POLYGON((4 2, 5 3, 4 3))', "
+                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2)), "
+                                         "((1 1, -1 1, -1 -1, 1 -1, 1 1)))') "
+                                         "from geospatial_test limit 1;",
+                                         dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(2.0),
+                v<double>(run_simple_agg("SELECT ST_Distance("
+                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2)), "
+                                         "((1 1, -1 1, -1 -1, 1 -1, 1 1)))', "
+                                         "'POLYGON((4 2, 5 3, 4 3))') "
+                                         "from geospatial_test limit 1;",
+                                         dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(1.4142),
+                v<double>(run_simple_agg("SELECT ST_Distance("
+                                         "'MULTIPOLYGON(((2 2, -2 2, -2 -2, 2 -2, 2 2)), "
+                                         "((1 1, -1 1, -1 -1, 1 -1, 1 1)))', "
+                                         "'MULTIPOLYGON(((4 2, 5 3, 4 3)), "
+                                         "((3 3, 4 3, 3 4)))') "
+                                         "from geospatial_test limit 1;",
+                                         dt)),
+                static_cast<double>(0.01));
+
+    ASSERT_NEAR(static_cast<double>(25.4558441),
+                v<double>(run_simple_agg(
+                    "SELECT ST_MaxDistance('POINT(1 1)', 'LINESTRING (9 0,18 18,19 19)') "
+                    "FROM geospatial_test limit 1;",
+                    dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(26.87005768),
+                v<double>(run_simple_agg("SELECT Max(ST_MaxDistance(l, 'POINT(0 0)')) "
+                                         "FROM geospatial_test;",
+                                         dt)),
+                static_cast<double>(0.01));
+    ASSERT_NEAR(static_cast<double>(14.142135),
+                v<double>(run_simple_agg(
+                    " SELECT Max(ST_MaxDistance(p, l)) FROM geospatial_test;", dt)),
                 static_cast<double>(0.01));
 
     // Geodesic distance between Paris and LA geographic points: ~9105km
@@ -9864,10 +10292,206 @@ TEST(Select, GeoSpatial_Projection) {
                                          dt)),
                 static_cast<double>(0.0001));
 
+    // ST_Intersects
+    ASSERT_EQ(static_cast<int64_t>(0),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Intersects("
+                  "ST_GeomFromText('POINT(0.9 0.9)'), "
+                  "ST_GeomFromText('POINT(1.1 1.1)')) FROM geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg("SELECT ST_Intersects("
+                                        "ST_GeomFromText('POINT(1 1)'), "
+                                        "ST_GeomFromText('LINESTRING(2 0, 0 2, -2 0, 0 "
+                                        "-2)')) FROM geospatial_test limit 1;",
+                                        dt)));
+    ASSERT_EQ(static_cast<int64_t>(0),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Intersects("
+                  "ST_GeomFromText('LINESTRING(2 0, 0 2, -2 0, 0 -2)'), "
+                  "ST_GeomFromText('POINT(1 0)')) FROM geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(0),
+              v<int64_t>(run_simple_agg("SELECT ST_Intersects("
+                                        "ST_GeomFromText('POINT(1 1)'), "
+                                        "ST_GeomFromText('POLYGON((0 0, 1 0, 0 1, 0 "
+                                        "0))')) FROM geospatial_test limit 1;",
+                                        dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Intersects("
+                  "ST_GeomFromText('POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))'), "
+                  "ST_GeomFromText('POINT(1 1)')) FROM geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(0),
+        v<int64_t>(run_simple_agg(
+            "SELECT ST_Intersects("
+            "ST_GeomFromText('POINT(1 1)'), "
+            "ST_GeomFromText('MULTIPOLYGON(((5 5, 6 6, 5 6)), ((0 0, 1 0, 0 1, 0 0)))')) "
+            " FROM geospatial_test limit 1;",
+            dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Intersects("
+                  "ST_GeomFromText('MULTIPOLYGON(((0 0, 2 0, 2 2, 0 2, 0 0)), ((5 5, 6 "
+                  "6, 5 6)))'), "
+                  "ST_GeomFromText('POINT(1 1)')) FROM geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg("SELECT ST_Intersects("
+                                  "ST_GeomFromText('LINESTRING(1 1, 0.5 1.5, 2 4)'), "
+                                  "ST_GeomFromText('LINESTRING(2 0, 0 2, -2 0, 0 -2)')) "
+                                  "FROM geospatial_test limit 1;",
+                                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(0),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Intersects("
+                  "ST_GeomFromText('LINESTRING(1 1, 0.5 1.5, 1.5 1, 1.5 1.5)'), "
+                  "ST_GeomFromText('LINESTRING(1 0, 0 1, -1 0, 0 -1)')) FROM "
+                  "geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(0),
+        v<int64_t>(run_simple_agg("SELECT ST_Intersects("
+                                  "ST_GeomFromText('LINESTRING(3 3, 3 2, 2.1 2.1)'), "
+                                  "ST_GeomFromText('POLYGON((2 2, 0 1, -2 2, -2 0, 2 0, "
+                                  "2 2))')) FROM geospatial_test limit 1;",
+                                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            "SELECT ST_Intersects("
+            "ST_GeomFromText('POLYGON((2 2, 0 1, -2 2, -2 0, 2 0, 2 2))'), "
+            "ST_GeomFromText('LINESTRING(3 3, 3 2, 2 2)')) FROM geospatial_test limit 1;",
+            dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(0),
+        v<int64_t>(run_simple_agg("SELECT ST_Intersects("
+                                  "ST_GeomFromText('LINESTRING(3 3, 3 2, 2.1 2.1)'), "
+                                  "ST_GeomFromText('MULTIPOLYGON(((5 5, 6 6, 5 6)), ((2 "
+                                  "2, 0 1, -2 2, -2 0, 2 0, 2 2)))')) "
+                                  " FROM geospatial_test limit 1;",
+                                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            "SELECT ST_Intersects("
+            "ST_GeomFromText('MULTIPOLYGON(((2 2, 0 1, -2 2, -2 0, 2 0, 2 2)), ((5 5, 6 "
+            "6, 5 6)))'), "
+            "ST_GeomFromText('LINESTRING(3 3, 3 2, 2 2)')) FROM geospatial_test limit 1;",
+            dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Intersects("
+                  "ST_GeomFromText('POLYGON((-118.66313066279504 44.533565793694436,"
+                  "-115.28301791070872 44.533565793694436,-115.28301791070872 "
+                  "46.49961643537853,"
+                  "-118.66313066279504 46.49961643537853,-118.66313066279504 "
+                  "44.533565793694436))'),"
+                  "ST_GeomFromText('LINESTRING (-118.526348964556 45.6369689645418,"
+                  "-118.568716970537 45.552529965319,-118.604668964913 45.5192699867856,"
+                  "-118.700612922525 45.4517749629224)')) from test limit 1;",
+                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(1),
+        v<int64_t>(run_simple_agg(
+            "SELECT ST_Intersects("
+            "ST_GeomFromText('POLYGON((-165.27254008488316 60.286744877866084,"
+            "-164.279755308478 60.286744877866084, -164.279755308478 60.818880025426154,"
+            "-165.27254008488316 60.818880025426154))', 4326), "
+            "ST_GeomFromText('MULTIPOLYGON (((-165.273152946156 60.5488599839382,"
+            "-165.244307548387 60.4963022239955,-165.23881195357 60.4964759808483,"
+            "-165.234271979534 60.4961199595109,-165.23165799921 60.496354988076,"
+            "-165.229399998313 60.4973489979735,-165.225239975948 60.4977589987674,"
+            "-165.217958113746 60.4974514248303,-165.21276192051 60.4972319866052)))', "
+            "4326)) FROM geospatial_test limit "
+            "1;",
+            dt)));
+
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows),
+              v<int64_t>(run_simple_agg(
+                  "SELECT COUNT(*) FROM geospatial_test WHERE ST_Intersects(p,p);", dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),
+              v<int64_t>(
+                  run_simple_agg("SELECT count(*) FROM geospatial_test "
+                                 "WHERE ST_Intersects(p, ST_GeomFromText('POINT(0 0)'));",
+                                 dt)));
+    ASSERT_EQ(static_cast<int64_t>(6),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_test "
+                  "WHERE ST_Intersects(p, ST_GeomFromText('LINESTRING(0 0, 5 5)'));",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(g_num_rows),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_test "
+                  "WHERE ST_Intersects(p, ST_GeomFromText('LINESTRING(0 0, 15 15)'));",
+                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(6),
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM geospatial_test "
+            "WHERE ST_Intersects(l, ST_GeomFromText('LINESTRING(0.5 0.5, 6.5 0.5)'));",
+            dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(6),
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM geospatial_test "
+            "WHERE ST_Intersects(poly, ST_GeomFromText('LINESTRING(0 4.5, 7 0.5)'));",
+            dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(6),
+        v<int64_t>(run_simple_agg(
+            "SELECT count(*) FROM geospatial_test "
+            "WHERE ST_Intersects(mpoly, ST_GeomFromText('LINESTRING(0 4.5, 7 0.5)'));",
+            dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(6),
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM geospatial_test "
+                                  "WHERE ST_Intersects(l, ST_GeomFromText('POLYGON((0.5 "
+                                  "0.5, 6.5 0.5, 3 0.1))'));",
+                                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(6),
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM geospatial_test "
+                                  "WHERE ST_Intersects(poly, ST_GeomFromText('POLYGON((0 "
+                                  "4.5, 7 0.5, 10 10))'));",
+                                  dt)));
+    ASSERT_EQ(
+        static_cast<int64_t>(6),
+        v<int64_t>(run_simple_agg("SELECT count(*) FROM geospatial_test "
+                                  "WHERE ST_Intersects(mpoly, "
+                                  "ST_GeomFromText('POLYGON((0 4.5, 7 0.5, 10 10))'));",
+                                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(6),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_test "
+                  "WHERE ST_Intersects(l, ST_GeomFromText('MULTIPOLYGON(((0.5 0.5, 6.5 "
+                  "0.5, 3 0.1)))'));",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(6),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_test "
+                  "WHERE ST_Intersects(poly, ST_GeomFromText('MULTIPOLYGON(((0 4.5, 7 "
+                  "0.5, 10 10)))'));",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(6),
+              v<int64_t>(run_simple_agg(
+                  "SELECT count(*) FROM geospatial_test "
+                  "WHERE ST_Intersects(mpoly, ST_GeomFromText('MULTIPOLYGON(((0 4.5, 7 "
+                  "0.5, 10 10)))'));",
+                  dt)));
+
     // ST_Contains
     ASSERT_EQ(static_cast<int64_t>(g_num_rows),
               v<int64_t>(run_simple_agg(
                   "SELECT COUNT(*) FROM geospatial_test WHERE ST_Contains(p,p);", dt)));
+    ASSERT_EQ(static_cast<int64_t>(2),
+              v<int64_t>(run_simple_agg(
+                  "SELECT COUNT(*) FROM geospatial_test WHERE "
+                  "ST_Contains('POINT(0 0)', p) OR ST_Contains('POINT(1 1)', p);",
+                  dt)));
     ASSERT_EQ(
         static_cast<int64_t>(1),
         v<int64_t>(run_simple_agg(
@@ -9963,11 +10587,34 @@ TEST(Select, GeoSpatial_Projection) {
                   "ST_GeomFromText('LINESTRING(1 0, 0 1, -1 0, 0 -1, 3 0)')) "
                   "FROM geospatial_test limit 1;",
                   dt)));
+    ASSERT_EQ(static_cast<int64_t>(0),    // polygon containing linestring vertices
+              v<int64_t>(run_simple_agg(  // but not all of linestring's segments
+                  "SELECT ST_Contains("
+                  "ST_GeomFromText('POLYGON((2 2, 0 1, -2 2, -2 0, 2 0, 2 2))'), "
+                  "ST_GeomFromText('LINESTRING(1.5 1.5, -1.5 1.5, 0 0.5, 1.5 1.5)')) "
+                  "FROM geospatial_test limit 1;",
+                  dt)));
     ASSERT_EQ(static_cast<int64_t>(1),  // polygon containing another polygon
               v<int64_t>(run_simple_agg(
                   "SELECT ST_Contains("
                   "ST_GeomFromText('POLYGON((2 0, 0 2, -2 0, 0 -2, 2 0))'), "
                   "ST_GeomFromText('POLYGON((1 0, 0 1, -1 0, 0 -1, 1 0))')) "
+                  "FROM geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(1),  // multipolygon containing linestring
+              v<int64_t>(run_simple_agg(
+                  "SELECT ST_Contains("
+                  "ST_GeomFromText('MULTIPOLYGON(((3 3, 4 3, 4 4)), "
+                  "((2 0, 0 2, -2 0, 0 -2, 2 0)))'), "
+                  "ST_GeomFromText('LINESTRING(1 0, 0 1, -1 0, 0 -1, 1 0)')) "
+                  "FROM geospatial_test limit 1;",
+                  dt)));
+    ASSERT_EQ(static_cast<int64_t>(0),    // multipolygon containing linestring vertices
+              v<int64_t>(run_simple_agg(  // but not all of linestring's segments
+                  "SELECT ST_Contains("
+                  "ST_GeomFromText('MULTIPOLYGON(((2 2, 0 1, -2 2, -2 0, 2 0, 2 2)), "
+                  "((3 3, 4 3, 4 4)))'), "
+                  "ST_GeomFromText('LINESTRING(1.5 1.5, -1.5 1.5, 0 0.5, 1.5 1.5)')) "
                   "FROM geospatial_test limit 1;",
                   dt)));
     // Tolerance
@@ -10429,6 +11076,19 @@ TEST(Select, Sample) {
       const auto empty_row = rows->getNextRow(true, true);
       ASSERT_EQ(size_t(0), empty_row.size());
     });
+    {
+      const auto rows = run_multiple_agg(
+          "SELECT SAMPLE(real_str), COUNT(*) FROM test WHERE x > 7 GROUP BY x;", dt);
+      const auto crt_row = rows->getNextRow(true, true);
+      ASSERT_EQ(size_t(2), crt_row.size());
+      const auto nullable_str = v<NullableString>(crt_row[0]);
+      const auto str_ptr = boost::get<std::string>(&nullable_str);
+      ASSERT_TRUE(str_ptr);
+      ASSERT_EQ("real_bar", boost::get<std::string>(*str_ptr));
+      ASSERT_EQ(g_num_rows / 2, v<int64_t>(crt_row[1]));
+      const auto empty_row = rows->getNextRow(true, true);
+      ASSERT_EQ(size_t(0), empty_row.size());
+    }
     SKIP_ON_AGGREGATOR({
       const auto rows = run_multiple_agg(
           "SELECT SAMPLE(arr_i64), COUNT(*) FROM array_test WHERE x = 8;", dt);
@@ -10439,6 +11099,16 @@ TEST(Select, Sample) {
       const auto empty_row = rows->getNextRow(true, true);
       ASSERT_EQ(size_t(0), empty_row.size());
     });
+    {
+      const auto rows = run_multiple_agg(
+          "SELECT SAMPLE(arr_i64), COUNT(*) FROM array_test WHERE x = 8 GROUP BY x;", dt);
+      const auto crt_row = rows->getNextRow(true, true);
+      ASSERT_EQ(size_t(2), crt_row.size());
+      compare_array(crt_row[0], std::vector<int64_t>{200, 300, 400});
+      ASSERT_EQ(static_cast<int64_t>(1), v<int64_t>(crt_row[1]));
+      const auto empty_row = rows->getNextRow(true, true);
+      ASSERT_EQ(size_t(0), empty_row.size());
+    }
     SKIP_ON_AGGREGATOR({
       const auto rows = run_multiple_agg(
           "SELECT SAMPLE(arr3_i64), COUNT(*) FROM array_test WHERE x = 8;", dt);
@@ -10449,29 +11119,22 @@ TEST(Select, Sample) {
       const auto empty_row = rows->getNextRow(true, true);
       ASSERT_EQ(size_t(0), empty_row.size());
     });
+    {
+      const auto rows = run_multiple_agg(
+          "SELECT SAMPLE(arr3_i64), COUNT(*) FROM array_test WHERE x = 8 GROUP BY x;",
+          dt);
+      const auto crt_row = rows->getNextRow(true, true);
+      ASSERT_EQ(size_t(2), crt_row.size());
+      compare_array(crt_row[0], std::vector<int64_t>{200, 300, 400});
+      ASSERT_EQ(static_cast<int64_t>(1), v<int64_t>(crt_row[1]));
+      const auto empty_row = rows->getNextRow(true, true);
+      ASSERT_EQ(size_t(0), empty_row.size());
+    }
     auto check_sample_rowid = [](const int64_t val) {
       const std::set<int64_t> valid_row_ids{15, 16, 17, 18, 19};
       ASSERT_TRUE(valid_row_ids.find(val) != valid_row_ids.end())
           << "Last sample rowid value " << val << " is invalid";
     };
-    SKIP_ON_AGGREGATOR({
-      const auto rows = run_multiple_agg(
-          "SELECT SAMPLE(rowid), AVG(d), AVG(f), str FROM test WHERE d > 2.4 GROUP "
-          "BY str;",
-          dt);
-      const auto crt_row = rows->getNextRow(true, true);
-      ASSERT_EQ(size_t(4), crt_row.size());
-      const auto rowid = v<int64_t>(crt_row[0]);
-      check_sample_rowid(rowid);
-      const auto d = v<double>(crt_row[1]);
-      ASSERT_EQ(2.6, d);
-      const auto f = v<double>(crt_row[2]);
-      ASSERT_EQ(1.3, f);
-      const auto nullable_str = v<NullableString>(crt_row[3]);
-      const auto str_ptr = boost::get<std::string>(&nullable_str);
-      ASSERT_TRUE(str_ptr);
-      ASSERT_EQ("baz", boost::get<std::string>(*str_ptr));
-    });
     SKIP_ON_AGGREGATOR({
       const auto rows = run_multiple_agg(
           "SELECT AVG(d), AVG(f), str, SAMPLE(rowid) FROM test WHERE d > 2.4 GROUP "
@@ -10490,17 +11153,64 @@ TEST(Select, Sample) {
       const auto rowid = v<int64_t>(crt_row[3]);
       check_sample_rowid(rowid);
     });
-    {
+    SKIP_ON_AGGREGATOR({
       const auto rows = run_multiple_agg("SELECT SAMPLE(str) FROM test WHERE x > 8;", dt);
       const auto crt_row = rows->getNextRow(true, true);
       ASSERT_EQ(size_t(1), crt_row.size());
       const auto nullable_str = v<NullableString>(crt_row[0]);
       ASSERT_FALSE(boost::get<void*>(nullable_str));
-    }
+    });
   }
 }
 
 namespace {
+
+int create_sharded_join_table(const std::string& table_name,
+                              size_t fragment_size,
+                              size_t num_rows,
+                              const ShardInfo& shard_info,
+                              bool with_delete_support = true) {
+  std::string columns_definition{"i INTEGER, j INTEGER, s TEXT ENCODING DICT(32)"};
+
+  try {
+    std::string drop_ddl{"DROP TABLE IF EXISTS " + table_name + ";"};
+    run_ddl_statement(drop_ddl);
+    g_sqlite_comparator.query(drop_ddl);
+
+    const auto create_ddl = build_create_table_statement(columns_definition,
+                                                         table_name,
+                                                         shard_info,
+                                                         {},
+                                                         fragment_size,
+                                                         with_delete_support);
+    run_ddl_statement(create_ddl);
+    g_sqlite_comparator.query("CREATE TABLE " + table_name + "(i int, j int, s text);");
+
+    const std::vector<std::string> alphabet{"a", "b", "c", "d", "e", "f", "g", "h", "i",
+                                            "j", "k", "l", "m", "n", "o", "p", "q", "r",
+                                            "s", "t", "u", "v", "w", "x", "y", "z"};
+    const auto alphabet_sz = alphabet.size();
+
+    int i = 0;
+    int j = num_rows;
+    for (size_t x = 0; x < num_rows; x++) {
+      const std::string insert_query{"INSERT INTO " + table_name + " VALUES(" +
+                                     std::to_string(i) + "," + std::to_string(j) + ",'" +
+                                     alphabet[i % alphabet_sz] + "');"};
+      LOG(INFO) << insert_query;
+
+      run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
+      g_sqlite_comparator.query(insert_query);
+      i++;
+      j--;
+    }
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed to (re-)create tables for Inner Join sharded test: "
+               << e.what();
+    return -EEXIST;
+  }
+  return 0;
+}
 
 int create_and_populate_rounding_table() {
   try {
@@ -10682,6 +11392,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
     const std::string drop_old_test{"DROP TABLE IF EXISTS test;"};
     run_ddl_statement(drop_old_test);
     g_sqlite_comparator.query(drop_old_test);
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
     std::string columns_definition{
         "x int not null, y int, z smallint, t bigint, b boolean, f float, ff float, fn "
         "float, d double, dn double, str "
@@ -10694,6 +11405,19 @@ int create_and_populate_tables(bool with_delete_support = true) {
         "encoding fixed(16), dd decimal(10, 2), dd_notnull decimal(10, 2) not null, ss "
         "text encoding dict, u int, ofd "
         "int, ufd int not null, ofq bigint, ufq bigint not null"};
+#else
+    std::string columns_definition{
+        "x int not null, y int, z smallint, t bigint, b boolean, f float, ff float, fn "
+        "float, d double, dn double, str "
+        "varchar(10), null_str text encoding dict, fixed_str text encoding dict(16), "
+        "fixed_null_str text encoding "
+        "dict(16), real_str text encoding none, shared_dict text, m timestamp(0), "
+        "n time(0), o date, o1 date encoding "
+        "fixed(32), fx int "
+        "encoding fixed(16), dd decimal(10, 2), dd_notnull decimal(10, 2) not null, ss "
+        "text encoding dict, u int, ofd "
+        "int, ufd int not null, ofq bigint, ufq bigint not null"};
+#endif
     const std::string create_test = build_create_table_statement(
         columns_definition,
         "test",
@@ -10702,6 +11426,7 @@ int create_and_populate_tables(bool with_delete_support = true) {
         2,
         with_delete_support);
     run_ddl_statement(create_test);
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
     g_sqlite_comparator.query(
         "CREATE TABLE test(x int not null, y int, z smallint, t bigint, b boolean, f "
         "float, ff float, fn float, d "
@@ -10713,12 +11438,26 @@ int create_and_populate_tables(bool with_delete_support = true) {
         "fx int, dd decimal(10, 2), dd_notnull decimal(10, 2) not "
         "null, ss "
         "text, u int, ofd int, ufd int not null, ofq bigint, ufq bigint not null);");
+#else
+    g_sqlite_comparator.query(
+        "CREATE TABLE test(x int not null, y int, z smallint, t bigint, b boolean, f "
+        "float, ff float, fn float, d "
+        "double, dn double, str varchar(10), null_str text, fixed_str text, "
+        "fixed_null_str text, real_str text, "
+        "shared_dict "
+        "text, m timestamp(0), n "
+        "time(0), o date, o1 date, "
+        "fx int, dd decimal(10, 2), dd_notnull decimal(10, 2) not "
+        "null, ss "
+        "text, u int, ofd int, ufd int not null, ofq bigint, ufq bigint not null);");
+#endif
   } catch (...) {
     LOG(ERROR) << "Failed to (re-)create table 'test'";
     return -EEXIST;
   }
   CHECK_EQ(g_num_rows % 2, 0);
   for (ssize_t i = 0; i < g_num_rows; ++i) {
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
     const std::string insert_query{
         "INSERT INTO test VALUES(7, 42, 101, 1001, 't', 1.1, 1.1, null, 2.2, null, "
         "'foo', null, 'foo', null, "
@@ -10728,10 +11467,20 @@ int create_and_populate_tables(bool with_delete_support = true) {
         "03:49:04.607435125', "
         "'15:13:14', '1999-09-09', '1999-09-09', 9, 111.1, 111.1, 'fish', null, "
         "2147483647, -2147483648, null, -1);"};
+#else
+    const std::string insert_query{
+        "INSERT INTO test VALUES(7, 42, 101, 1001, 't', 1.1, 1.1, null, 2.2, null, "
+        "'foo', null, 'foo', null, "
+        "'real_foo', 'foo',"
+        "'2014-12-13 22:23:15', "
+        "'15:13:14', '1999-09-09', '1999-09-09', 9, 111.1, 111.1, 'fish', null, "
+        "2147483647, -2147483648, null, -1);"};
+#endif
     run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
     g_sqlite_comparator.query(insert_query);
   }
   for (ssize_t i = 0; i < g_num_rows / 2; ++i) {
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
     const std::string insert_query{
         "INSERT INTO test VALUES(8, 43, -78, 1002, 'f', 1.2, 101.2, -101.2, 2.4, "
         "-2002.4, 'bar', null, 'bar', null, "
@@ -10741,10 +11490,21 @@ int create_and_populate_tables(bool with_delete_support = true) {
         "null, null, null, "
         "-2147483647, "
         "9223372036854775807, -9223372036854775808);"};
+#else
+    const std::string insert_query{
+        "INSERT INTO test VALUES(8, 43, -78, 1002, 'f', 1.2, 101.2, -101.2, 2.4, "
+        "-2002.4, 'bar', null, 'bar', null, "
+        "'real_bar', NULL, '2014-12-13 22:23:15', "
+        "'15:13:14', NULL, NULL, NULL, 222.2, 222.2, "
+        "null, null, null, "
+        "-2147483647, "
+        "9223372036854775807, -9223372036854775808);"};
+#endif
     run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
     g_sqlite_comparator.query(insert_query);
   }
   for (ssize_t i = 0; i < g_num_rows / 2; ++i) {
+#ifndef DISABLE_HIGH_PRECISION_TIMESTAMP
     const std::string insert_query{
         "INSERT INTO test VALUES(7, 43, 102, 1002, 't', 1.3, 1000.3, -1000.3, 2.6, "
         "-220.6, 'baz', null, null, null, "
@@ -10754,6 +11514,16 @@ int create_and_populate_tables(bool with_delete_support = true) {
         "333.3, 333.3, "
         "'boat', null, 1, "
         "-1, 1, -9223372036854775808);"};
+#else
+    const std::string insert_query{
+        "INSERT INTO test VALUES(7, 43, 102, 1002, 't', 1.3, 1000.3, -1000.3, 2.6, "
+        "-220.6, 'baz', null, null, null, "
+        "'real_baz', 'baz', '2014-12-14 22:23:15', "
+        "'15:13:14', '1999-09-09', '1999-09-09', 11, "
+        "333.3, 333.3, "
+        "'boat', null, 1, "
+        "-1, 1, -9223372036854775808);"};
+#endif
     run_multiple_agg(insert_query, ExecutorDeviceType::CPU);
     g_sqlite_comparator.query(insert_query);
   }
@@ -10864,6 +11634,32 @@ int create_and_populate_tables(bool with_delete_support = true) {
     return -EEXIST;
   }
   import_array_test("array_test_inner");
+  if (!g_aggregator) {
+    try {
+      size_t num_shards = choose_shard_count();
+      // check if the oversubscriptions to GPU for multiple Shard is correctly functional
+      // or not.
+      const size_t num_oversubscription = 10;
+
+      ShardInfo shard_info{(num_shards) ? "i" : "", num_shards};
+      size_t fragment_size = 2;
+      bool delete_support = false;
+
+      create_sharded_join_table("st1",
+                                fragment_size,
+                                num_oversubscription * num_shards,
+                                shard_info,
+                                delete_support);
+      create_sharded_join_table(
+          "st2", fragment_size, num_shards * fragment_size, shard_info, delete_support);
+      create_sharded_join_table(
+          "st3", fragment_size, 8 * num_shards, shard_info, delete_support);
+
+    } catch (...) {
+      LOG(ERROR) << "Failed to (re-)create table 'array_test_inner'";
+      return -EEXIST;
+    }
+  }
   try {
     const std::string drop_old_single_row_test{"DROP TABLE IF EXISTS single_row_test;"};
     run_ddl_statement(drop_old_single_row_test);
@@ -10902,6 +11698,12 @@ int create_and_populate_tables(bool with_delete_support = true) {
     import_big_decimal_range_test();
   } catch (...) {
     LOG(ERROR) << "Failed to (re-)create table 'big_decimal_range_test'";
+    return -EEXIST;
+  }
+  try {
+    import_decimal_compression_test();
+  } catch (...) {
+    LOG(ERROR) << "Failed to (re-)create table 'decimal_compression_test";
     return -EEXIST;
   }
   try {
@@ -11115,6 +11917,8 @@ void drop_tables() {
   run_ddl_statement(drop_query_rewrite_test);
   const std::string drop_big_decimal_range_test{"DROP TABLE big_decimal_range_test;"};
   run_ddl_statement(drop_big_decimal_range_test);
+  const std::string drop_decimal_compression_test{"DROP TABLE decimal_compression_test;"};
+  run_ddl_statement(drop_decimal_compression_test);
   g_sqlite_comparator.query(drop_query_rewrite_test);
   const std::string drop_array_test{"DROP TABLE array_test;"};
   run_ddl_statement(drop_array_test);
@@ -11218,11 +12022,6 @@ int main(int argc, char** argv) {
 
   desc.add_options()("disable-literal-hoisting", "Disable literal hoisting");
   desc.add_options()("with-sharding", "Create sharded tables");
-  desc.add_options()("left-deep-join-optimization",
-                     po::value<bool>(&g_left_deep_join_optimization)
-                         ->default_value(g_left_deep_join_optimization)
-                         ->implicit_value(true),
-                     "Enable left-deep join optimization");
   desc.add_options()("from-table-reordering",
                      po::value<bool>(&g_from_table_reordering)
                          ->default_value(g_from_table_reordering)
@@ -11238,6 +12037,11 @@ int main(int argc, char** argv) {
                          ->default_value(g_enable_smem_group_by)
                          ->implicit_value(false),
                      "Enable/disable using GPU shared memory for GROUP BY.");
+  desc.add_options()("enable-columnar-output",
+                     po::value<bool>(&g_enable_columnar_output)
+                         ->default_value(g_enable_columnar_output)
+                         ->implicit_value(true),
+                     "Enable/disable using columnar output format.");
   desc.add_options()("keep-data", "Don't drop tables at the end of the tests");
   desc.add_options()(
       "use-existing-data",
@@ -11251,7 +12055,6 @@ int main(int argc, char** argv) {
                          ->default_value(g_fast_strcmp)
                          ->implicit_value(false),
                      "Disable fast string comparison");
-
   desc.add_options()(
       "test-help",
       "Print all ExecuteTest specific options (for gtest options use `--help`).");

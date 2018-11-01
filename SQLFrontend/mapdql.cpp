@@ -33,6 +33,7 @@
 #include <boost/archive/iterators/binary_from_base64.hpp>
 #include <boost/archive/iterators/transform_width.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/format.hpp>
 #include <boost/program_options.hpp>
 #include <cmath>
 #include <csignal>
@@ -48,11 +49,11 @@
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/protocol/TJSONProtocol.h>
 #include <thrift/transport/TBufferTransports.h>
-#include <thrift/transport/THttpClient.h>
 #include <thrift/transport/TSocket.h>
 #include "../Fragmenter/InsertOrderFragmenter.h"
 #include "MapDRelease.h"
 #include "MapDServer.h"
+#include "Shared/ThriftClient.h"
 #include "Shared/ThriftTypesConvert.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/mapd_shared_ptr.h"
@@ -66,6 +67,8 @@
 using namespace ::apache::thrift;
 using namespace ::apache::thrift::protocol;
 using namespace ::apache::thrift::transport;
+
+using namespace std::string_literals;
 
 const std::string MapDQLRelease(MAPD_RELEASE);
 
@@ -409,7 +412,8 @@ std::string scalar_datum_to_string(const TDatum& datum, const TTypeInfo& type_in
       return std::to_string(datum.val.int_val);
     case TDatumType::DECIMAL: {
       std::ostringstream dout;
-      dout << std::setprecision(type_info.precision) << datum.val.real_val;
+      const auto format_str = "%." + std::to_string(type_info.scale) + "f";
+      dout << boost::format(format_str) % datum.val.real_val;
       return dout.str();
     }
     case TDatumType::DOUBLE: {
@@ -570,14 +574,16 @@ std::string mapd_getpass() {
 
 enum Action { INITIALIZE, TURN_ON, TURN_OFF, INTERRUPT };
 
-bool backchannel(int action, ClientContext* cc) {
+bool backchannel(int action, ClientContext* cc, const std::string& ccn = "") {
   enum State { UNINITIALIZED, INITIALIZED, INTERRUPTIBLE };
   static int state = UNINITIALIZED;
   static ClientContext* context{nullptr};
+  static std::string ca_cert_name{};
 
   if (action == INITIALIZE) {
     CHECK(cc);
     context = cc;
+    ca_cert_name = ccn;
     state = INITIALIZED;
     return false;
   }
@@ -594,14 +600,16 @@ bool backchannel(int action, ClientContext* cc) {
     mapd::shared_ptr<TTransport> transport2;
     mapd::shared_ptr<TProtocol> protocol2;
     mapd::shared_ptr<TTransport> socket2;
-    if (context->http) {
-      transport2 = mapd::shared_ptr<TTransport>(
-          new THttpClient(context->server_host, context->port, "/"));
+    if (context->http || context->https) {
+      transport2 = openHttpClientTransport(context->server_host,
+                                           context->port,
+                                           ca_cert_name,
+                                           context->https,
+                                           context->skip_host_verify);
       protocol2 = mapd::shared_ptr<TProtocol>(new TJSONProtocol(transport2));
     } else {
-      socket2 =
-          mapd::shared_ptr<TTransport>(new TSocket(context->server_host, context->port));
-      transport2 = mapd::shared_ptr<TTransport>(new TBufferedTransport(socket2));
+      transport2 =
+          openBufferedClientTransport(context->server_host, context->port, ca_cert_name);
       protocol2 = mapd::shared_ptr<TProtocol>(new TBinaryProtocol(transport2));
     }
     MapDClient c2(protocol2);
@@ -848,74 +856,34 @@ void print_all_hardware_info(ClientContext& context) {
 }
 
 static void print_privs(const std::vector<bool>& privs, TDBObjectType::type type) {
-  if (type == TDBObjectType::DatabaseDBObjectType) {
-    if (privs[0]) {
-      std::cout << " create";
-    }
-    if (privs[1]) {
-      std::cout << " drop";
-    }
-    if (privs[2]) {
-      std::cout << " view-sql-editor";
-    }
-    if (privs[3]) {
-      std::cout << " login-access";
-    }
-  } else if (type == TDBObjectType::TableDBObjectType) {
-    if (privs[0]) {
-      std::cout << " create";
-    }
-    if (privs[1]) {
-      std::cout << " drop";
-    }
-    if (privs[2]) {
-      std::cout << " select";
-    }
-    if (privs[3]) {
-      std::cout << " insert";
-    }
-    if (privs[4]) {
-      std::cout << " update";
-    }
-    if (privs[5]) {
-      std::cout << " delete";
-    }
-    if (privs[6]) {
-      std::cout << " truncate";
-    }
+  // Client priviliges print lookup
+  static const std::unordered_map<const TDBObjectType::type,
+                                  const std::vector<std::string>>
+      privilege_names_lookup{
+          {TDBObjectType::DatabaseDBObjectType,
+           {" create"s, " drop"s, " view-sql-editor"s, " login-access"s}},
+          {TDBObjectType::TableDBObjectType,
+           {" create"s,
+            " drop"s,
+            " select"s,
+            " insert"s,
+            " update"s,
+            " delete"s,
+            " truncate"s,
+            " alter"s}},
+          {TDBObjectType::DashboardDBObjectType,
+           {" create"s, " delete"s, " view"s, " edit"s}},
+          {TDBObjectType::ViewDBObjectType,
+           {" create"s, " drop"s, " select"s, " insert"s, " update"s, " delete"s}}};
 
-  } else if (type == TDBObjectType::DashboardDBObjectType) {
-    if (privs[0]) {
-      std::cout << " create";
-    }
-    if (privs[1]) {
-      std::cout << " delete";
-    }
-    if (privs[2]) {
-      std::cout << " view";
-    }
-    if (privs[3]) {
-      std::cout << " edit";
-    }
-
-  } else if (type == TDBObjectType::ViewDBObjectType) {
-    if (privs[0]) {
-      std::cout << " create";
-    }
-    if (privs[1]) {
-      std::cout << " drop";
-    }
-    if (privs[2]) {
-      std::cout << " select";
-    }
-    if (privs[3]) {
-      std::cout << " insert";
-    }
-    if (privs[4]) {
-      std::cout << " update";
-    }
-    if (privs[5]) {
-      std::cout << " delete";
+  const auto privilege_names = privilege_names_lookup.find(type);
+  size_t i = 0;
+  if (privilege_names != privilege_names_lookup.end()) {
+    for (const auto& priv : privs) {
+      if (priv) {
+        std::cout << privilege_names->second[i];
+      }
+      ++i;
     }
   }
 }
@@ -1044,9 +1012,12 @@ int main(int argc, char** argv) {
   bool print_connection = true;
   bool print_timing = false;
   bool http = false;
+  bool https = false;
+  bool skip_host_verify = false;
   TQueryResult _return;
   std::string db_name{"mapd"};
   std::string user_name{"mapd"};
+  std::string ca_cert_name{""};
   std::string passwd;
 
   namespace po = boost::program_options;
@@ -1067,6 +1038,10 @@ int main(int argc, char** argv) {
   desc.add_options()("user,u",
                      po::value<std::string>(&user_name)->default_value(user_name),
                      "User name");
+  desc.add_options()(
+      "ca-cert",
+      po::value<std::string>(&ca_cert_name)->default_value(ca_cert_name),
+      "Path to trusted server certificate. Initiates an encrypted connection");
   desc.add_options()("passwd,p", po::value<std::string>(&passwd), "Password");
   desc.add_options()("server,s",
                      po::value<std::string>(&server_host)->default_value(server_host),
@@ -1075,6 +1050,14 @@ int main(int argc, char** argv) {
   desc.add_options()("http",
                      po::bool_switch(&http)->default_value(http)->implicit_value(true),
                      "Use HTTP transport");
+  desc.add_options()("https",
+                     po::bool_switch(&https)->default_value(https)->implicit_value(true),
+                     "Use HTTPS transport");
+  desc.add_options()("skip-verify",
+                     po::bool_switch(&skip_host_verify)
+                         ->default_value(skip_host_verify)
+                         ->implicit_value(true),
+                     "Don't verify SSL certificate validity");
   desc.add_options()("quiet,q", "Do not print result headers or connection strings ");
 
   po::variables_map vm;
@@ -1124,12 +1107,12 @@ int main(int argc, char** argv) {
   mapd::shared_ptr<TTransport> transport;
   mapd::shared_ptr<TProtocol> protocol;
   mapd::shared_ptr<TTransport> socket;
-  if (http) {
-    transport = mapd::shared_ptr<TTransport>(new THttpClient(server_host, port, "/"));
+  if (https || http) {
+    transport =
+        openHttpClientTransport(server_host, port, ca_cert_name, https, skip_host_verify);
     protocol = mapd::shared_ptr<TProtocol>(new TJSONProtocol(transport));
   } else {
-    socket = mapd::shared_ptr<TTransport>(new TSocket(server_host, port));
-    transport = mapd::shared_ptr<TTransport>(new TBufferedTransport(socket));
+    transport = openBufferedClientTransport(server_host, port, ca_cert_name);
     protocol = mapd::shared_ptr<TProtocol>(new TBinaryProtocol(transport));
   }
   MapDClient c(protocol);
@@ -1142,7 +1125,8 @@ int main(int argc, char** argv) {
   context.server_host = server_host;
   context.port = port;
   context.http = http;
-
+  context.https = https;
+  context.skip_host_verify = skip_host_verify;
   context.session = INVALID_SESSION_ID;
 
   try {
@@ -1166,7 +1150,7 @@ int main(int argc, char** argv) {
   }
 
   register_signal_handler();
-  (void)backchannel(INITIALIZE, &context);
+  (void)backchannel(INITIALIZE, &context, ca_cert_name);
 
   /* Set the completion callback. This will be called every time the
    * user uses the <tab> key. */

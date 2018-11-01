@@ -9,6 +9,7 @@ add_executable(RunQueryLoop RunQueryLoop.cpp)
 add_executable(StringDictionaryTest StringDictionaryTest.cpp)
 add_executable(PlanTest PlanTest.cpp)
 add_executable(ProfileTest ProfileTest.cpp)
+add_executable(ExperimentalTest ExperimentalTest.cpp)
 
 if(ENABLE_CUDA)
   set(MAPD_DEFINITIONS -DHAVE_CUDA)
@@ -23,7 +24,7 @@ if(ENABLE_CUDA)
         -D_FORCE_INLINES
         ${MAPD_DEFINITIONS}
         -arch sm_30
-        -std=c++11
+        -std=c++14
         -shared
         ${CMAKE_CURRENT_SOURCE_DIR}/ProfileUtils.cu
         -o ${CMAKE_CURRENT_BINARY_DIR}/libProfileUtils.so
@@ -46,6 +47,7 @@ add_executable(TokenCompletionHintsTest TokenCompletionHintsTest.cpp)
 add_executable(MapDQLCommandTest MapDQLCommandTest.cpp)
 add_executable(DBObjectPrivilegesTest DBObjectPrivilegesTest.cpp)
 add_executable(GeoTypesTest Shared/GeoTypesTest.cpp)
+add_executable(CtasTest CtasTest.cpp)
 
 target_link_libraries(ProfileTest gtest Shared Calcite QueryEngine ${MAPD_RENDERING_LIBRARIES} CsvImport QueryRunner Parser ${Boost_LIBRARIES} ${Glog_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${PROF_LIBRARIES} ${LLVM_LINKER_FLAGS} ${CURSES_LIBRARIES})
 target_link_libraries(ResultSetTest gtest gtest QueryEngine ${MAPD_RENDERING_LIBRARIES} ${Boost_LIBRARIES} CsvImport QueryRunner Parser DataMgr Chunk ${Boost_LIBRARIES} ${Glog_LIBRARIES} ${CMAKE_DL_LIBS} ${CUDA_LIBRARIES} ${LLVM_LINKER_FLAGS} ${CURSES_LIBRARIES})
@@ -67,8 +69,10 @@ target_link_libraries(StorageTest gtest ${EXECUTE_TEST_LIBS})
 target_link_libraries(StoragePerfTest gtest ${EXECUTE_TEST_LIBS})
 target_link_libraries(TopKTest ${EXECUTE_TEST_LIBS})
 target_link_libraries(MapDQLCommandTest gtest ${EXECUTE_TEST_LIBS} ${Boost_LIBRARIES})
+target_link_libraries(ExperimentalTest gtest ${EXECUTE_TEST_LIBS} ${Boost_LIBRARIES})
 target_link_libraries(DBObjectPrivilegesTest gtest ${EXECUTE_TEST_LIBS} ${Boost_LIBRARIES})
 target_link_libraries(GeoTypesTest gtest ${EXECUTE_TEST_LIBS})
+target_link_libraries(CtasTest gtest ${EXECUTE_TEST_LIBS})
 
 set(TEST_ARGS "--gtest_output=xml:../")
 add_test(PlanTest PlanTest ${TEST_ARGS})
@@ -88,6 +92,7 @@ add_test(TokenCompletionHintsTest TokenCompletionHintsTest ${TEST_ARGS})
 add_test(MapDQLCommandTest MapDQLCommandTest ${TEST_ARGS})
 add_test(DBObjectPrivilegesTest DBObjectPrivilegesTest ${TEST_ARGS})
 add_test(GeoTypesTest GeoTypesTest ${TEST_ARGS})
+add_test(CtasTest CtasTest ${TEST_ARGS})
 
 # parse s3 credentials
 file(READ aws/s3client.conf S3CLIENT_CONF)
@@ -115,6 +120,7 @@ set(SANITY_TESTS
   MapDQLCommandTest
   DBObjectPrivilegesTest
   GeoTypesTest
+  CtasTest
 )
 set_tests_properties(${SANITY_TESTS} PROPERTIES LABELS "sanity")
 

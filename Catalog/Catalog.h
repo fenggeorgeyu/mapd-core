@@ -46,11 +46,11 @@
 #include "ColumnDescriptor.h"
 #include "DictDescriptor.h"
 #include "FrontendViewDescriptor.h"
+#include "Grantee.h"
 #include "LdapServer.h"
 #include "LinkDescriptor.h"
 #include "ObjectRoleDescriptor.h"
 #include "RestServer.h"
-#include "Role.h"
 #include "TableDescriptor.h"
 
 #include "../DataMgr/DataMgr.h"
@@ -274,6 +274,8 @@ class Catalog {
   int getLogicalTableId(const int physicalTableId) const;
   void checkpoint(const int logicalTableId) const;
   std::string name() const { return get_currentDB().dbName; }
+  void eraseDBData();
+  void eraseTablePhysicalData(const TableDescriptor* td);
 
  protected:
   typedef std::map<std::string, TableDescriptor*> TableDescriptorMap;
@@ -434,14 +436,20 @@ class SysCatalog {
                       DBObjectType type,
                       const Catalog_Namespace::Catalog& catalog,
                       int32_t objectId = -1);
-  void grantDBObjectPrivileges(const std::string& roleName,
-                               DBObject& object,
+  void grantDBObjectPrivileges(const std::string& grantee,
+                               const DBObject& object,
                                const Catalog_Namespace::Catalog& catalog);
-  void revokeDBObjectPrivileges(const std::string& roleName,
-                                DBObject object,
+  void grantDBObjectPrivilegesBatch(const std::vector<std::string>& grantees,
+                                    const std::vector<DBObject>& objects,
+                                    const Catalog_Namespace::Catalog& catalog);
+  void revokeDBObjectPrivileges(const std::string& grantee,
+                                const DBObject& object,
                                 const Catalog_Namespace::Catalog& catalog);
-  void revokeDBObjectPrivilegesFromAllRoles_unsafe(DBObject object, Catalog* catalog);
-  void getDBObjectPrivileges(const std::string& roleName,
+  void revokeDBObjectPrivilegesBatch(const std::vector<std::string>& grantees,
+                                     const std::vector<DBObject>& objects,
+                                     const Catalog_Namespace::Catalog& catalog);
+  void revokeDBObjectPrivilegesFromAll_unsafe(DBObject object, Catalog* catalog);
+  void getDBObjectPrivileges(const std::string& granteeName,
                              DBObject& object,
                              const Catalog_Namespace::Catalog& catalog) const;
   bool verifyDBObjectOwnership(const UserMetadata& user,
@@ -449,26 +457,32 @@ class SysCatalog {
                                const Catalog_Namespace::Catalog& catalog);
   void createRole(const std::string& roleName, const bool& userPrivateRole = false);
   void dropRole(const std::string& roleName);
-  void grantRole(const std::string& roleName, const std::string& userName);
-  void revokeRole(const std::string& roleName, const std::string& userName);
+  void grantRoleBatch(const std::vector<std::string>& roles,
+                      const std::vector<std::string>& grantees);
+  void grantRole(const std::string& role, const std::string& grantee);
+  void revokeRoleBatch(const std::vector<std::string>& roles,
+                       const std::vector<std::string>& grantees);
+  void revokeRole(const std::string& role, const std::string& grantee);
   // check if the user has any permissions on all the given objects
   bool hasAnyPrivileges(const UserMetadata& user, std::vector<DBObject>& privObjects);
   // check if the user has the requested permissions on all the given objects
-  bool checkPrivileges(const UserMetadata& user, std::vector<DBObject>& privObjects);
-  bool checkPrivileges(const std::string& userName, std::vector<DBObject>& privObjects);
-  Role* getMetadataForRole(const std::string& roleName) const;
-  Role* getMetadataForUserRole(int32_t userId) const;
+  bool checkPrivileges(const UserMetadata& user,
+                       const std::vector<DBObject>& privObjects) const;
+  bool checkPrivileges(const std::string& userName,
+                       const std::vector<DBObject>& privObjects) const;
+  Grantee* getGrantee(const std::string& name) const;
+  Role* getRoleGrantee(const std::string& name) const;
+  User* getUserGrantee(const std::string& name) const;
   std::vector<ObjectRoleDescriptor*> getMetadataForObject(int32_t dbId,
                                                           int32_t dbType,
                                                           int32_t objectId) const;
-  bool isRoleGrantedToUser(const int32_t userId, const std::string& roleName) const;
-  bool hasRole(const std::string& roleName,
-               bool userPrivateRole) const;  // true - role exists, false - otherwise
+  bool isRoleGrantedToGrantee(const std::string& granteeName,
+                              const std::string& roleName,
+                              bool only_direct) const;
   std::vector<std::string> getRoles(bool userPrivateRole,
                                     bool isSuper,
-                                    const int32_t userId);
+                                    const std::string& userName);
   std::vector<std::string> getRoles(const int32_t dbId);
-  std::vector<std::string> getUserRoles(const int32_t userId);
   bool arePrivilegesOn() const { return check_privileges_; }
 
   static SysCatalog& instance() {
@@ -478,10 +492,11 @@ class SysCatalog {
 
   void populateRoleDbObjects(const std::vector<DBObject>& objects);
   std::string name() const { return MAPD_SYSTEM_DB; }
+  void renameObjectsInDescriptorMap(DBObject& object,
+                                    const Catalog_Namespace::Catalog& cat);
 
  private:
-  typedef std::map<std::string, Role*> RoleMap;
-  typedef std::map<int32_t, Role*> UserRoleMap;
+  typedef std::map<std::string, Grantee*> GranteeMap;
   typedef std::multimap<std::string, ObjectRoleDescriptor*> ObjectRoleDescriptorMap;
 
   SysCatalog()
@@ -500,7 +515,6 @@ class SysCatalog {
   void migratePrivileges();
   void migratePrivileged_old();
   void updatePasswordsToHashes();
-  void dropUserRole(const std::string& userName);
   void migrateDBAccessPrivileges();
 
   // Here go functions not wrapped into transactions (necessary for nested calls)
@@ -508,8 +522,12 @@ class SysCatalog {
   void createRole_unsafe(const std::string& roleName,
                          const bool& userPrivateRole = false);
   void dropRole_unsafe(const std::string& roleName);
-  void grantRole_unsafe(const std::string& roleName, const std::string& userName);
-  void revokeRole_unsafe(const std::string& roleName, const std::string& userName);
+  void grantRoleBatch_unsafe(const std::vector<std::string>& roles,
+                             const std::vector<std::string>& grantees);
+  void grantRole_unsafe(const std::string& roleName, const std::string& granteeName);
+  void revokeRoleBatch_unsafe(const std::vector<std::string>& roles,
+                              const std::vector<std::string>& grantees);
+  void revokeRole_unsafe(const std::string& roleName, const std::string& granteeName);
   void updateObjectDescriptorMap(const std::string& roleName,
                                  DBObject& object,
                                  bool roleType,
@@ -518,16 +536,24 @@ class SysCatalog {
   void deleteObjectDescriptorMap(const std::string& roleName,
                                  DBObject& object,
                                  const Catalog_Namespace::Catalog& cat);
-  void grantDBObjectPrivileges_unsafe(const std::string& roleName,
-                                      DBObject& object,
+  void grantDBObjectPrivilegesBatch_unsafe(const std::vector<std::string>& grantees,
+                                           const std::vector<DBObject>& objects,
+                                           const Catalog_Namespace::Catalog& catalog);
+  void grantDBObjectPrivileges_unsafe(const std::string& granteeName,
+                                      const DBObject object,
                                       const Catalog_Namespace::Catalog& catalog);
-  void revokeDBObjectPrivileges_unsafe(const std::string& roleName,
+  void revokeDBObjectPrivilegesBatch_unsafe(const std::vector<std::string>& grantees,
+                                            const std::vector<DBObject>& objects,
+                                            const Catalog_Namespace::Catalog& catalog);
+  void revokeDBObjectPrivileges_unsafe(const std::string& granteeName,
                                        DBObject object,
                                        const Catalog_Namespace::Catalog& catalog);
   void grantAllOnDatabase_unsafe(const std::string& roleName,
                                  DBObject& object,
                                  const Catalog_Namespace::Catalog& catalog);
-  void revokeAllOnDatabase_unsafe(const std::string& roleName, int32_t dbId, Role* rl);
+  void revokeAllOnDatabase_unsafe(const std::string& roleName,
+                                  int32_t dbId,
+                                  Grantee* grantee);
 
   template <typename F, typename... Args>
   void execInTransaction(F&& f, Args&&... args) {
@@ -543,8 +569,7 @@ class SysCatalog {
 
   bool check_privileges_;
   std::string basePath_;
-  RoleMap roleMap_;
-  UserRoleMap userRoleMap_;
+  GranteeMap granteeMap_;
   ObjectRoleDescriptorMap objectDescriptorMap_;
   DBMetadata currentDB_;
   std::unique_ptr<SqliteConnector> sqliteConnector_;

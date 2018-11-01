@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.3)
 
-if("${CMAKE_VERSION}" VERSION_GREATER_EQUAL 3.12.0)
+if("${CMAKE_VERSION}" VERSION_GREATER 3.11.999)
   cmake_policy(SET CMP0074 NEW)
 endif()
 
@@ -57,7 +57,8 @@ option(PREFER_STATIC_LIBS "Prefer linking against static libraries" OFF)
 if(PREFER_STATIC_LIBS)
   set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
   set(Boost_USE_STATIC_LIBS ON)
-
+  set(OPENSSL_USE_STATIC_LIBS ON)
+  set(Thrift_USE_STATIC_LIBS ON)
   if(${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static-libgcc -static-libstdc++")
   endif()
@@ -107,6 +108,13 @@ if(XCODE)
   endif()
   add_definitions("-DXCODE")
 endif()
+
+# fixme: hack works for Homebrew, might not work for Conda
+if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+  set(OPENSSL_ROOT_DIR "/usr/local/opt/openssl/")
+endif()
+find_package(OpenSSL REQUIRED)
+include_directories(${OPENSSL_INCLUDE_DIR})
 
 find_package(Thrift REQUIRED)
 include_directories(${Thrift_INCLUDE_DIRS})
@@ -341,19 +349,19 @@ else()
   set(ENABLE_RENDERING OFF CACHE BOOL "Build backend renderer" FORCE)
 endif()
 
-option(ENABLE_JOIN_EXEC "Enable RA vm to execute join node" ON)
-if(ENABLE_JOIN_EXEC)
-  add_definitions("-DENABLE_JOIN_EXEC")
-endif()
 option(ENABLE_ONE_TO_MANY_HASH_JOIN "Enable hash join on a column w/ duplicate values" ON)
 if(ENABLE_ONE_TO_MANY_HASH_JOIN)
   add_definitions("-DENABLE_ONE_TO_MANY_HASH_JOIN")
 endif()
 
-
 option(ENABLE_COMPACTION "Enable Compaction and Overflow/Underflow Detection" OFF)
 if(ENABLE_COMPACTION)
   add_definitions("-DENABLE_COMPACTION")
+endif()
+
+option(DISABLE_HIGH_PRECISION_TIMESTAMP "Disable parser support for creating milli, micro, and nanosecond timestamp columns" ON)
+if(DISABLE_HIGH_PRECISION_TIMESTAMP) 
+  add_definitions("-DDISABLE_HIGH_PRECISION_TIMESTAMP")
 endif()
 
 option(ENABLE_PROFILER "Enable google perftools" OFF)
@@ -512,11 +520,17 @@ if(DOXYGEN_FOUND)
 endif(DOXYGEN_FOUND)
 
 # Packaging
+
+string(TOLOWER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_LOWER)
+if(NOT "${CMAKE_BUILD_TYPE_LOWER}" STREQUAL "debug" AND NOT "${CMAKE_BUILD_TYPE_LOWER}" STREQUAL "relwithdebinfo")
+  set(CPACK_STRIP_FILES ON)
+else()
+  set(MAPD_PACKAGE_FLAGS "${MAPD_PACKAGE_FLAGS}-debug")
+endif()
 set(CPACK_PACKAGE_VENDOR "MapD Technologies, Inc.")
 set(CPACK_PACKAGE_CONTACT "support@mapd.com")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "MapD Core Database")
 set(CPACK_PROJECT_CONFIG_FILE ${CMAKE_SOURCE_DIR}/CMakePackaging.txt)
-set(CPACK_STRIP_FILES ON)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "default-jre-headless | openjdk-8-jre-headless | java8-runtime-headless, bsdmainutils, curl | wget")
 set(CPACK_RPM_PACKAGE_REQUIRES "java-headless, util-linux, curl")
 set(CPACK_RPM_PACKAGE_AUTOREQ OFF)
@@ -626,14 +640,18 @@ set(MAPD_JAR_RELEASE_VERSION "${MAPD_VERSION_MAJOR}.${MAPD_VERSION_MINOR}.${MAPD
 if("${MAPD_VERSION_EXTRA}" STREQUAL "dev")
   set (MAPD_JAR_RELEASE_VERSION "${MAPD_JAR_RELEASE_VERSION}-SNAPSHOT")
 endif()
+
+set (MAPD_COMMON_JAR "mapdcommon-${MAPD_JAR_RELEASE_VERSION}.jar")
 set (MAPD_JDBC_JAR "mapdjdbc-${MAPD_JAR_RELEASE_VERSION}.jar")
 
 add_custom_command(
   OUTPUT
+    ${CMAKE_BINARY_DIR}/bin/${MAPD_COMMON_JAR}
     ${CMAKE_BINARY_DIR}/bin/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar
     ${CMAKE_BINARY_DIR}/bin/${MAPD_JDBC_JAR}
     ${CMAKE_BINARY_DIR}/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar
     COMMAND MVNPATH=${CMAKE_SOURCE_DIR}/java ${MVN_EXECUTABLE} -q clean install -Dthrift.version="${Thrift_VERSION}" -Dmapd.release.version="${MAPD_JAR_RELEASE_VERSION}"
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/mapdcommon/target/${MAPD_COMMON_JAR} ${CMAKE_BINARY_DIR}/bin
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/mapd/target/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar ${CMAKE_BINARY_DIR}/bin
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/mapdjdbc/target/${MAPD_JDBC_JAR} ${CMAKE_BINARY_DIR}/bin
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/java/calcite/target/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar ${CMAKE_BINARY_DIR}/bin
@@ -647,6 +665,7 @@ add_custom_command(
     ${JAVA_SOURCES}
   )
 add_custom_target(mapd_java_components ALL DEPENDS
+  ${CMAKE_BINARY_DIR}/bin/${MAPD_COMMON_JAR}
   ${CMAKE_BINARY_DIR}/bin/mapd-1.0-SNAPSHOT-jar-with-dependencies.jar
   ${CMAKE_BINARY_DIR}/bin/${MAPD_JDBC_JAR}
   ${CMAKE_BINARY_DIR}/bin/calcite-1.0-SNAPSHOT-jar-with-dependencies.jar)

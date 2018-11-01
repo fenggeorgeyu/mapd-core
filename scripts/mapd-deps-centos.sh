@@ -74,8 +74,8 @@ makej
 make install PREFIX=$PREFIX
 popd
 
-# https://www.openssl.org/source/openssl-1.0.2o.tar.gz
-download_make_install ${HTTP_DEPS}/openssl-1.0.2o.tar.gz "" "linux-$(uname -m) no-shared no-dso -fPIC"
+# https://www.openssl.org/source/openssl-1.0.2p.tar.gz
+download_make_install ${HTTP_DEPS}/openssl-1.0.2p.tar.gz "" "linux-$(uname -m) no-shared no-dso -fPIC"
 
 # libarchive
 download_make_install ${HTTP_DEPS}/xz-5.2.4.tar.xz "" "--disable-shared"
@@ -99,8 +99,8 @@ pushd boost_$VERS
 ./b2 cxxflags=-fPIC install --prefix=$PREFIX || true
 popd
 
-# https://cmake.org/files/v3.12/cmake-3.12.1.tar.gz
-download_make_install ${HTTP_DEPS}/cmake-3.12.1.tar.gz
+# https://cmake.org/files/v3.12/cmake-3.12.2.tar.gz
+download_make_install ${HTTP_DEPS}/cmake-3.12.2.tar.gz
 
 # folly
 VERS=3.0.0
@@ -145,7 +145,7 @@ popd
 # llvm
 # http://thrysoee.dk/editline/libedit-20170329-3.1.tar.gz
 download_make_install ${HTTP_DEPS}/libedit-20170329-3.1.tar.gz
-VERS=6.0.1
+VERS=7.0.0
 # http://releases.llvm.org
 download ${HTTP_DEPS}/llvm/$VERS/llvm-$VERS.src.tar.xz
 download ${HTTP_DEPS}/llvm/$VERS/cfe-$VERS.src.tar.xz
@@ -211,8 +211,8 @@ VERS=1.6.21
 # http://download.sourceforge.net/libpng/libpng-$VERS.tar.xz
 download_make_install ${HTTP_DEPS}/libpng-$VERS.tar.xz
 
-VERS=2.1.4_egl
-download https://github.com/vastcharade/glbinding/archive/v$VERS.tar.gz
+VERS=3.0.2
+download https://github.com/cginternals/glbinding/archive/v$VERS.tar.gz
 extract v$VERS.tar.gz
 BDIR="glbinding-$VERS/build"
 mkdir -p $BDIR
@@ -221,7 +221,6 @@ cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DOPTION_BUILD_DOCS=OFF \
     -DOPTION_BUILD_EXAMPLES=OFF \
-    -DOPTION_BUILD_GPU_TESTS=OFF \
     -DOPTION_BUILD_TESTS=OFF \
     -DOPTION_BUILD_TOOLS=OFF \
     -DOPTION_BUILD_WITH_BOOST_THREAD=OFF \
@@ -233,7 +232,7 @@ make install
 popd
 
 # c-blosc
-VERS=1.14.3
+VERS=1.14.4
 download https://github.com/Blosc/c-blosc/archive/v$VERS.tar.gz
 extract v$VERS.tar.gz
 BDIR="c-blosc-$VERS/build"
@@ -245,10 +244,10 @@ makej
 make install
 popd
 
-# geo
+# GEO STUFF
+# expat
 download_make_install https://github.com/libexpat/libexpat/releases/download/R_2_2_5/expat-2.2.5.tar.bz2
-
-# https://github.com/google/libkml/archive/master.zip
+# kml
 download ${HTTP_DEPS}/libkml-master.zip
 unzip -u libkml-master.zip
 pushd libkml-master
@@ -257,25 +256,56 @@ CXXFLAGS="-std=c++03" ./configure --with-expat-include-dir=$PREFIX/include/ --wi
 makej
 make install
 popd
-
-download_make_install https://github.com/OSGeo/proj.4/releases/download/5.1.0/proj-5.1.0.tar.gz
-# http://download.osgeo.org/gdal/2.3.1/gdal-2.3.1.tar.xz
-download_make_install ${HTTP_DEPS}/gdal-2.3.1.tar.xz "" "--without-geos --with-libkml=$PREFIX --with-static-proj4=$PREFIX"
+# proj
+download_make_install ${HTTP_DEPS}/proj-5.2.0.tar.gz
+# gdal
+download_make_install ${HTTP_DEPS}/gdal-2.3.2.tar.xz "" "--without-geos --with-libkml=$PREFIX --with-proj=$PREFIX"
 
 # Apache Arrow (see common-functions.sh)
 install_arrow
 
-VERS=1.10.3
+VERS=1.11
 ARCH=$(uname -m)
 ARCH=${ARCH//x86_64/amd64}
 ARCH=${ARCH//aarch64/arm64}
 # https://dl.google.com/go/go$VERS.linux-$ARCH.tar.gz
 download ${HTTP_DEPS}/go$VERS.linux-$ARCH.tar.gz
-extract go$VERS.linux-amd64.tar.gz
+extract go$VERS.linux-$ARCH.tar.gz
 mv go $PREFIX
 
 # install AWS core and s3 sdk
 install_awscpp -j $(nproc)
+
+# glslang (with spirv-tools)
+VERS=7.9.2888 # 8/13/18
+rm -rf glslang
+mkdir -p glslang
+pushd glslang
+wget --continue https://github.com/KhronosGroup/glslang/archive/$VERS.tar.gz
+tar xvf $VERS.tar.gz
+pushd glslang-$VERS
+./update_glslang_sources.py
+mkdir build
+pushd build
+cmake \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    ..
+make -j $(nproc)
+make install
+popd # build
+popd # glslang-$VERS
+popd # glslang
+
+# Vulkan
+VERS=1.1.82.1 # 8/20/18
+rm -rf vulkan
+mkdir -p vulkan
+pushd vulkan
+wget --continue https://vulkan.lunarg.com/sdk/download/$VERS/linux/vulkansdk-linux-x86_64-$VERS.tar.gz?Human=true -O vulkansdk-linux-x86_64-$VERS.tar.gz
+tar xvf vulkansdk-linux-x86_64-$VERS.tar.gz
+rsync -av $VERS/x86_64/* $PREFIX
+popd # vulkan
 
 sed -e "s|%MAPD_DEPS_ROOT%|$PREFIX|g" mapd-deps.modulefile.in > mapd-deps-$SUFFIX.modulefile
 sed -e "s|%MAPD_DEPS_ROOT%|$PREFIX|g" mapd-deps.sh.in > mapd-deps-$SUFFIX.sh

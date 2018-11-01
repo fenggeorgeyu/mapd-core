@@ -158,7 +158,7 @@ bool ResultSet::canUseFastBaselineSort(
     const std::list<Analyzer::OrderEntry>& order_entries,
     const size_t top_n) {
   if (order_entries.size() != 1 || query_mem_desc_.hasKeylessHash() ||
-      query_mem_desc_.sortOnGpu()) {
+      query_mem_desc_.sortOnGpu() || query_mem_desc_.didOutputColumnar()) {
     return false;
   }
   const auto& order_entry = order_entries.front();
@@ -168,9 +168,9 @@ bool ResultSet::canUseFastBaselineSort(
   if (!target_info.sql_type.is_number() || is_distinct_target(target_info)) {
     return false;
   }
-  return (query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::MultiCol ||
-          query_mem_desc_.getGroupByColRangeType() ==
-              GroupByColRangeType::OneColKnownRange) &&
+  return (query_mem_desc_.getQueryDescriptionType() ==
+              QueryDescriptionType::GroupByBaselineHash ||
+          query_mem_desc_.isSingleColumnGroupByWithPerfectHash()) &&
          top_n;
 }
 

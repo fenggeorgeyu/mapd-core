@@ -85,7 +85,11 @@ class ResultSetStorage {
                    int8_t* buff,
                    const bool buff_is_provided);
 
-  void reduce(const ResultSetStorage& that) const;
+  void reduce(const ResultSetStorage& that,
+              const std::vector<std::string>& serialized_varlen_buffer) const;
+
+  void rewriteAggregateBufferOffsets(
+      const std::vector<std::string>& serialized_varlen_buffer) const;
 
   int8_t* getUnderlyingBuffer() const;
 
@@ -93,20 +97,24 @@ class ResultSetStorage {
   void moveEntriesToBuffer(int8_t* new_buff, const size_t new_entry_count) const;
 
  private:
-  void reduceEntriesNoCollisionsColWise(int8_t* this_buff,
-                                        const int8_t* that_buff,
-                                        const ResultSetStorage& that,
-                                        const size_t start_index,
-                                        const size_t end_index) const;
+  void reduceEntriesNoCollisionsColWise(
+      int8_t* this_buff,
+      const int8_t* that_buff,
+      const ResultSetStorage& that,
+      const size_t start_index,
+      const size_t end_index,
+      const std::vector<std::string>& serialized_varlen_buffer) const;
 
   void copyKeyColWise(const size_t entry_idx,
                       int8_t* this_buff,
                       const int8_t* that_buff) const;
 
-  void reduceOneEntryNoCollisionsRowWise(const size_t i,
-                                         int8_t* this_buff,
-                                         const int8_t* that_buff,
-                                         const ResultSetStorage& that) const;
+  void reduceOneEntryNoCollisionsRowWise(
+      const size_t i,
+      int8_t* this_buff,
+      const int8_t* that_buff,
+      const ResultSetStorage& that,
+      const std::vector<std::string>& serialized_varlen_buffer) const;
 
   bool isEmptyEntry(const size_t entry_idx, const int8_t* buff) const;
   bool isEmptyEntry(const size_t entry_idx) const;
@@ -145,7 +153,8 @@ class ResultSetStorage {
                      const size_t target_logical_idx,
                      const size_t target_slot_idx,
                      const size_t init_agg_val_idx,
-                     const ResultSetStorage& that) const;
+                     const ResultSetStorage& that,
+                     const std::vector<std::string>& serialized_varlen_buffer) const;
 
   void reduceOneCountDistinctSlot(int8_t* this_ptr1,
                                   const int8_t* that_ptr1,
@@ -153,6 +162,8 @@ class ResultSetStorage {
                                   const ResultSetStorage& that) const;
 
   void fillOneEntryRowWise(const std::vector<int64_t>& entry);
+
+  void fillOneEntryColWise(const std::vector<int64_t>& entry);
 
   void initializeRowWise() const;
 
@@ -183,7 +194,7 @@ class ResultSetStorage {
 namespace Analyzer {
 
 class Expr;
-class NDVEstimator;
+class Estimator;
 struct OrderEntry;
 
 }  // namespace Analyzer
@@ -214,6 +225,62 @@ void deallocate_arrow_result(const ArrowResult& result,
                              const size_t device_id,
                              Data_Namespace::DataMgr* data_mgr);
 
+class ResultSet;
+
+class ResultSetRowIterator {
+ public:
+  using value_type = std::vector<TargetValue>;
+  using difference_type = std::ptrdiff_t;
+  using pointer = std::vector<TargetValue>*;
+  using reference = std::vector<TargetValue>&;
+  using iterator_category = std::input_iterator_tag;
+
+  bool operator==(const ResultSetRowIterator& other) const {
+    return result_set_ == other.result_set_ &&
+           crt_row_buff_idx_ == other.crt_row_buff_idx_;
+  }
+  bool operator!=(const ResultSetRowIterator& other) const { return !(*this == other); }
+
+  inline value_type operator*() const;
+  inline ResultSetRowIterator& operator++(void);
+  ResultSetRowIterator operator++(int) {
+    ResultSetRowIterator iter(*this);
+    ++(*this);
+    return iter;
+  }
+
+  size_t getCurrentRowBufferIndex() const {
+    if (crt_row_buff_idx_ == 0) {
+      throw std::runtime_error("current row buffer iteration index is undefined");
+    }
+    return crt_row_buff_idx_ - 1;
+  }
+
+ private:
+  const ResultSet* result_set_;
+  size_t crt_row_buff_idx_;
+  size_t global_entry_idx_;
+  bool global_entry_idx_valid_;
+  size_t fetched_so_far_;
+  bool translate_strings_;
+  bool decimal_to_double_;
+
+  ResultSetRowIterator(const ResultSet* rs,
+                       bool translate_strings,
+                       bool decimal_to_double)
+      : result_set_(rs)
+      , crt_row_buff_idx_(0)
+      , global_entry_idx_(0)
+      , global_entry_idx_valid_(false)
+      , fetched_so_far_(0)
+      , translate_strings_(translate_strings)
+      , decimal_to_double_(decimal_to_double){};
+
+  ResultSetRowIterator(const ResultSet* rs) : ResultSetRowIterator(rs, false, false){};
+
+  friend class ResultSet;
+};
+
 class TSerializedRows;
 
 class ResultSet {
@@ -235,7 +302,7 @@ class ResultSet {
             const std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
             const Executor* executor);
 
-  ResultSet(const std::shared_ptr<const Analyzer::NDVEstimator>,
+  ResultSet(const std::shared_ptr<const Analyzer::Estimator>,
             const ExecutorDeviceType device_type,
             const int device_id,
             Data_Namespace::DataMgr* data_mgr);
@@ -247,6 +314,26 @@ class ResultSet {
             const std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner);
 
   ~ResultSet();
+
+  inline ResultSetRowIterator rowIterator(size_t from_logical_index,
+                                          bool translate_strings,
+                                          bool decimal_to_double) const {
+    ResultSetRowIterator rowIterator(this, translate_strings, decimal_to_double);
+
+    // move to first logical position
+    ++rowIterator;
+
+    for (size_t index = 0; index < from_logical_index; index++) {
+      ++rowIterator;
+    }
+
+    return rowIterator;
+  }
+
+  inline ResultSetRowIterator rowIterator(bool translate_strings,
+                                          bool decimal_to_double) const {
+    return rowIterator(0, translate_strings, decimal_to_double);
+  }
 
   ExecutorDeviceType getDeviceType() const;
 
@@ -330,7 +417,11 @@ class ResultSet {
 
   void fillOneEntry(const std::vector<int64_t>& entry) {
     CHECK(storage_);
-    storage_->fillOneEntryRowWise(entry);
+    if (storage_->query_mem_desc_.didOutputColumnar()) {
+      storage_->fillOneEntryColWise(entry);
+    } else {
+      storage_->fillOneEntryRowWise(entry);
+    }
   }
 
   void initializeStorage() const;
@@ -361,12 +452,14 @@ class ResultSet {
   };
 
   SerializedArrowOutput getSerializedArrowOutput(
-      const std::vector<std::string>& col_names) const;
+      const std::vector<std::string>& col_names,
+      const int32_t first_n) const;
 
   ArrowResult getArrowCopy(Data_Namespace::DataMgr* data_mgr,
                            const ExecutorDeviceType device_type,
                            const size_t device_id,
-                           const std::vector<std::string>& col_names) const;
+                           const std::vector<std::string>& col_names,
+                           const int32_t first_n) const;
 
   size_t getLimit();
 
@@ -375,6 +468,8 @@ class ResultSet {
   void setGeoReturnType(const GeoReturnType val) { geo_return_type_ = val; }
 
  private:
+  void advanceCursorToNextEntry(ResultSetRowIterator& iter) const;
+
   std::vector<TargetValue> getNextRowImpl(const bool translate_strings,
                                           const bool decimal_to_double) const;
 
@@ -409,13 +504,14 @@ class ResultSet {
       const bool decimal_to_double,
       const bool fixup_count_distinct_pointers) const;
 
-  TargetValue getTargetValueFromBufferColwise(const int8_t* col1_ptr,
-                                              const int8_t compact_sz1,
-                                              const int8_t* col2_ptr,
-                                              const int8_t compact_sz2,
-                                              const size_t entry_idx,
+  TargetValue getTargetValueFromBufferColwise(const int8_t* col_ptr,
+                                              const int8_t* keys_ptr,
+                                              const QueryMemoryDescriptor& query_mem_desc,
+                                              const size_t local_entry_idx,
+                                              const size_t global_entry_idx,
                                               const TargetInfo& target_info,
                                               const size_t target_logical_idx,
+                                              const size_t slot_idx,
                                               const bool translate_strings,
                                               const bool decimal_to_double) const;
 
@@ -604,17 +700,23 @@ class ResultSet {
 
   std::shared_ptr<arrow::RecordBatch> convertToArrow(
       const std::vector<std::string>& col_names,
-      arrow::ipc::DictionaryMemo& memo) const;
+      arrow::ipc::DictionaryMemo& memo,
+      const int32_t first_n) const;
   std::shared_ptr<const std::vector<std::string>> getDictionary(const int dict_id) const;
   std::shared_ptr<arrow::RecordBatch> getArrowBatch(
-      const std::shared_ptr<arrow::Schema>& schema) const;
+      const std::shared_ptr<arrow::Schema>& schema,
+      const int32_t first_n) const;
 
-  ArrowResult getArrowCopyOnCpu(const std::vector<std::string>& col_names) const;
+  ArrowResult getArrowCopyOnCpu(const std::vector<std::string>& col_names,
+                                const int32_t first_n) const;
   ArrowResult getArrowCopyOnGpu(Data_Namespace::DataMgr* data_mgr,
                                 const size_t device_id,
-                                const std::vector<std::string>& col_names) const;
+                                const std::vector<std::string>& col_names,
+                                const int32_t first_n) const;
 
   std::string serializeProjection() const;
+  void serializeVarlenAggColumn(int8_t* buf,
+                                std::vector<std::string>& varlen_bufer) const;
 
   void serializeCountDistinctColumns(TSerializedRows&) const;
 
@@ -654,7 +756,7 @@ class ResultSet {
   std::vector<std::vector<std::vector<int64_t>>> frag_offsets_;
   std::vector<std::vector<int64_t>> consistent_frag_sizes_;
 
-  const std::shared_ptr<const Analyzer::NDVEstimator> estimator_;
+  const std::shared_ptr<const Analyzer::Estimator> estimator_;
   int8_t* estimator_buffer_;
   mutable int8_t* host_estimator_buffer_;
   Data_Namespace::DataMgr* data_mgr_;
@@ -678,13 +780,41 @@ class ResultSet {
   std::unique_ptr<ResultSetComparator<ColumnWiseTargetAccessor>> column_wise_comparator_;
 
   friend class ResultSetManager;
+  friend class ResultSetRowIterator;
 };
+
+ResultSetRowIterator::value_type ResultSetRowIterator::operator*() const {
+  if (!global_entry_idx_valid_) {
+    return {};
+  }
+
+  if (result_set_->just_explain_) {
+    return {result_set_->explanation_};
+  }
+
+  return result_set_->getRowAt(
+      global_entry_idx_, translate_strings_, decimal_to_double_, false);
+}
+
+inline ResultSetRowIterator& ResultSetRowIterator::operator++(void) {
+  if (!result_set_->storage_ && !result_set_->just_explain_) {
+    global_entry_idx_valid_ = false;
+  } else if (result_set_->just_explain_) {
+    global_entry_idx_valid_ = 0 == fetched_so_far_;
+    fetched_so_far_ = 1;
+  } else {
+    result_set_->advanceCursorToNextEntry(*this);
+  }
+  return *this;
+}
 
 class ResultSetManager {
  public:
   ResultSet* reduce(std::vector<ResultSet*>&);
 
   std::shared_ptr<ResultSet> getOwnResultSet();
+
+  void rewriteVarlenAggregates(ResultSet*);
 
  private:
   std::shared_ptr<ResultSet> rs_;
@@ -700,5 +830,9 @@ int64_t lazy_decode(const ColumnLazyFetchInfo& col_lazy_fetch,
                     const int64_t pos);
 
 void fill_empty_key(void* key_ptr, const size_t key_count, const size_t key_width);
+
+bool can_use_parallel_algorithms(const ResultSet& rows);
+
+bool use_parallel_algorithms(const ResultSet& rows);
 
 #endif  // QUERYENGINE_RESULTSET_H

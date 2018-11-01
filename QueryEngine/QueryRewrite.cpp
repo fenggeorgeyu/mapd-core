@@ -88,9 +88,7 @@ RelAlgExecutionUnit QueryRewriter::rewriteConstrainedByIn(
   std::vector<Analyzer::Expr*> new_target_exprs;
   bool rewrite{false};
   size_t groupby_idx{0};
-  const auto redirected_exprs =
-      redirect_exprs(ra_exe_unit_.groupby_exprs, ra_exe_unit_.input_col_descs);
-  auto it = redirected_exprs.begin();
+  auto it = ra_exe_unit_.groupby_exprs.begin();
   for (const auto group_expr : ra_exe_unit_.groupby_exprs) {
     CHECK(group_expr);
     ++groupby_idx;
@@ -137,20 +135,13 @@ RelAlgExecutionUnit QueryRewriter::rewriteConstrainedByIn(
   if (!rewrite) {
     return ra_exe_unit_;
   }
-  CHECK(!contains_iter_expr(ra_exe_unit_.target_exprs));
   return {ra_exe_unit_.input_descs,
-          ra_exe_unit_.extra_input_descs,
           ra_exe_unit_.input_col_descs,
           ra_exe_unit_.simple_quals,
           ra_exe_unit_.quals,
-          ra_exe_unit_.join_type,
-          ra_exe_unit_.inner_joins,
-          ra_exe_unit_.join_dimensions,
-          ra_exe_unit_.inner_join_quals,
-          ra_exe_unit_.outer_join_quals,
+          ra_exe_unit_.join_quals,
           new_groupby_list,
           new_target_exprs,
-          ra_exe_unit_.orig_target_exprs,
           nullptr,
           ra_exe_unit_.sort_info,
           ra_exe_unit_.scan_limit};

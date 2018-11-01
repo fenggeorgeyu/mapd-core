@@ -52,6 +52,7 @@ bool g_cluster{false};
 bool g_bigint_count{false};
 int g_hll_precision_bits{11};
 extern size_t g_leaf_count;
+extern bool g_enable_columnar_output;
 
 #ifdef HAVE_CUDA
 namespace {
@@ -606,6 +607,8 @@ int32_t get_agg_count(const std::vector<Analyzer::Expr*>& target_exprs) {
       // TODO(pavan): or if is_geometry()
       if (ti.is_array() || (ti.is_string() && ti.get_compression() == kENCODING_NONE)) {
         agg_count += 2;
+      } else if (ti.is_geometry()) {
+        agg_count += ti.get_physical_coord_cols() * 2;
       } else {
         ++agg_count;
       }
@@ -663,8 +666,9 @@ ColRangeInfo GroupByAndAggregate::getColRangeInfo() {
       bool has_nulls{false};
       for (const auto groupby_expr : ra_exe_unit_.groupby_exprs) {
         auto col_range_info = getExprRangeInfo(groupby_expr.get());
-        if (col_range_info.hash_type_ != GroupByColRangeType::OneColKnownRange) {
-          return {GroupByColRangeType::MultiCol, 0, 0, 0, false};
+        if (col_range_info.hash_type_ != QueryDescriptionType::GroupByPerfectHash) {
+          // going through baseline hash if a non-integer type is encountered
+          return {QueryDescriptionType::GroupByBaselineHash, 0, 0, 0, false};
         }
         auto crt_col_cardinality = getBucketedCardinality(col_range_info);
         CHECK_GE(crt_col_cardinality, 0);
@@ -675,16 +679,25 @@ ColRangeInfo GroupByAndAggregate::getColRangeInfo() {
       }
       // For zero or high cardinalities, use baseline layout.
       if (!cardinality || cardinality > baseline_threshold) {
-        return {GroupByColRangeType::MultiCol, 0, 0, 0, false};
+        return {QueryDescriptionType::GroupByBaselineHash, 0, 0, 0, false};
       }
-      return {GroupByColRangeType::MultiColPerfectHash,
+      return {QueryDescriptionType::GroupByPerfectHash,
               0,
               int64_t(cardinality),
               0,
               has_nulls};
     } catch (...) {  // overflow when computing cardinality
-      return {GroupByColRangeType::MultiCol, 0, 0, 0, false};
+      return {QueryDescriptionType::GroupByBaselineHash, 0, 0, 0, false};
     }
+  }
+  // For single column groupby on high timestamps, force baseline hash due to wide ranges
+  // we are likely to encounter when applying quals to the expression range
+  // TODO: consider allowing TIMESTAMP(9) (nanoseconds) with quals to use perfect hash if
+  // the range is small enough
+  if (ra_exe_unit_.groupby_exprs.front() &&
+      ra_exe_unit_.groupby_exprs.front()->get_type_info().is_high_precision_timestamp() &&
+      ra_exe_unit_.simple_quals.size() > 0) {
+    return {QueryDescriptionType::GroupByBaselineHash, 0, 0, 0, false};
   }
   const auto col_range_info = getExprRangeInfo(ra_exe_unit_.groupby_exprs.front().get());
   if (!ra_exe_unit_.groupby_exprs.front()) {
@@ -701,7 +714,7 @@ ColRangeInfo GroupByAndAggregate::getColRangeInfo() {
        !expr_is_rowid(ra_exe_unit_.groupby_exprs.front().get(), *executor_->catalog_)) &&
       col_range_info.max >= col_range_info.min + max_entry_count &&
       !col_range_info.bucket) {
-    return {GroupByColRangeType::MultiCol,
+    return {QueryDescriptionType::GroupByBaselineHash,
             col_range_info.min,
             col_range_info.max,
             0,
@@ -712,17 +725,14 @@ ColRangeInfo GroupByAndAggregate::getColRangeInfo() {
 
 ColRangeInfo GroupByAndAggregate::getExprRangeInfo(const Analyzer::Expr* expr) const {
   if (!expr) {
-    return {GroupByColRangeType::Projection, 0, 0, 0, false};
+    return {QueryDescriptionType::Projection, 0, 0, 0, false};
   }
 
-  const auto expr_range =
-      getExpressionRange(redirect_expr(expr, ra_exe_unit_.input_col_descs).get(),
-                         query_infos_,
-                         executor_,
-                         boost::make_optional(ra_exe_unit_.simple_quals));
+  const auto expr_range = getExpressionRange(
+      expr, query_infos_, executor_, boost::make_optional(ra_exe_unit_.simple_quals));
   switch (expr_range.getType()) {
     case ExpressionRangeType::Integer:
-      return {GroupByColRangeType::OneColKnownRange,
+      return {QueryDescriptionType::GroupByPerfectHash,
               expr_range.getIntMin(),
               expr_range.getIntMax(),
               expr_range.getBucket(),
@@ -730,12 +740,12 @@ ColRangeInfo GroupByAndAggregate::getExprRangeInfo(const Analyzer::Expr* expr) c
     case ExpressionRangeType::Float:
     case ExpressionRangeType::Double:
     case ExpressionRangeType::Invalid:
-      return ColRangeInfo{GroupByColRangeType::MultiCol, 0, 0, 0, false};
+      return ColRangeInfo{QueryDescriptionType::GroupByBaselineHash, 0, 0, 0, false};
     default:
       CHECK(false);
   }
   CHECK(false);
-  return {GroupByColRangeType::Scan, 0, 0, 0, false};
+  return {QueryDescriptionType::NonGroupedAggregate, 0, 0, 0, false};
 }
 
 int64_t GroupByAndAggregate::getBucketedCardinality(const ColRangeInfo& col_range_info) {
@@ -806,16 +816,24 @@ GroupByAndAggregate::GroupByAndAggregate(
                               crt_min_byte_width,
                               sort_on_gpu_hint,
                               render_info,
-                              must_use_baseline_sort);
+                              must_use_baseline_sort,
+                              output_columnar_hint);
     if (device_type != ExecutorDeviceType::GPU) {
       // TODO(miyu): remove w/ interleaving
       query_mem_desc_.setHasInterleavedBinsOnGpu(false);
     }
+
     query_mem_desc_.setSortOnGpu(sort_on_gpu_hint &&
                                  query_mem_desc_.canOutputColumnar() &&
                                  !query_mem_desc_.hasKeylessHash());
-    output_columnar_ = (output_columnar_hint && query_mem_desc_.canOutputColumnar()) ||
-                       query_mem_desc_.sortOnGpu();
+
+    output_columnar_ =
+        (output_columnar_hint &&
+         (query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection ||
+          query_mem_desc_.getQueryDescriptionType() ==
+              QueryDescriptionType::GroupByBaselineHash)) ||
+        query_mem_desc_.sortOnGpu();
+
     query_mem_desc_.setOutputColumnar(output_columnar_);
     if (query_mem_desc_.sortOnGpu() &&
         (query_mem_desc_.getBufferSizeBytes(device_type_) +
@@ -858,7 +876,8 @@ void GroupByAndAggregate::initQueryMemoryDescriptor(
     const int8_t crt_min_byte_width,
     const bool sort_on_gpu_hint,
     RenderInfo* render_info,
-    const bool must_use_baseline_sort) {
+    const bool must_use_baseline_sort,
+    const bool output_columnar_hint) {
   addTransientStringLiterals();
 
   const auto count_distinct_descriptors = initCountDistinctDescriptors();
@@ -897,9 +916,10 @@ void GroupByAndAggregate::initQueryMemoryDescriptor(
                    col_range_info_nosharding.has_nulls};
 
   if (g_enable_watchdog &&
-      ((col_range_info.hash_type_ == GroupByColRangeType::MultiCol &&
+      ((col_range_info.hash_type_ == QueryDescriptionType::GroupByBaselineHash &&
         max_groups_buffer_entry_count > 120000000) ||
-       (col_range_info.hash_type_ == GroupByColRangeType::OneColKnownRange &&
+       (col_range_info.hash_type_ == QueryDescriptionType::GroupByPerfectHash &&
+        ra_exe_unit_.groupby_exprs.size() == 1 &&
         (col_range_info.max - col_range_info.min) /
                 std::max(col_range_info.bucket, int64_t(1)) >
             130000000))) {
@@ -919,7 +939,8 @@ void GroupByAndAggregate::initQueryMemoryDescriptor(
                                           max_groups_buffer_entry_count,
                                           render_info,
                                           count_distinct_descriptors,
-                                          must_use_baseline_sort);
+                                          must_use_baseline_sort,
+                                          output_columnar_hint);
 }
 
 void GroupByAndAggregate::addTransientStringLiterals() {
@@ -1038,7 +1059,7 @@ CountDistinctDescriptors GroupByAndAggregate::initCountDistinctDescriptors() {
       if (agg_info.is_distinct && arg_ti.is_geometry()) {
         throw std::runtime_error("COUNT DISTINCT on geometry columns not supported");
       }
-      ColRangeInfo no_range_info{GroupByColRangeType::Projection, 0, 0, 0, false};
+      ColRangeInfo no_range_info{QueryDescriptionType::Projection, 0, 0, 0, false};
       auto arg_range_info =
           arg_ti.is_fp() ? no_range_info : getExprRangeInfo(agg_expr->get_arg());
       CountDistinctImplType count_distinct_impl_type{CountDistinctImplType::StdSet};
@@ -1053,7 +1074,7 @@ CountDistinctDescriptors GroupByAndAggregate::initCountDistinctDescriptors() {
           bitmap_sz_bits = g_hll_precision_bits;
         }
       }
-      if (arg_range_info.hash_type_ == GroupByColRangeType::OneColKnownRange &&
+      if (arg_range_info.hash_type_ == QueryDescriptionType::GroupByPerfectHash &&
           !(arg_ti.is_array() || arg_ti.is_geometry())) {  // TODO(alex): allow bitmap
                                                            // implementation for arrays
         if (arg_range_info.isEmpty()) {
@@ -1307,7 +1328,7 @@ GroupByAndAggregate::KeylessInfo GroupByAndAggregate::getKeylessInfo(
 
 /**
  * Supported data types for the current shared memory usage for keyless aggregates with
- * COUNT(*) Currently only for OneColKnownRange hash type.
+ * COUNT(*) Currently only for single-column group by queries.
  */
 bool GroupByAndAggregate::supportedTypeForGpuSharedMemUsage(
     const SQLTypeInfo& target_type_info) const {
@@ -1369,7 +1390,8 @@ bool GroupByAndAggregate::gpuCanHandleOrderEntries(
         return false;
       }
       auto expr_range_info = getExprRangeInfo(agg_expr->get_arg());
-      if ((expr_range_info.hash_type_ != GroupByColRangeType::OneColKnownRange ||
+      if ((!(expr_range_info.hash_type_ == QueryDescriptionType::GroupByPerfectHash &&
+             query_mem_desc_.getGroupbyColCount() == 1) ||
            expr_range_info.has_nulls) &&
           order_entry.is_desc == order_entry.nulls_first) {
         return false;
@@ -1481,12 +1503,6 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
                               false);
     filter_false = filter_cfg.cond_false_;
 
-    if (executor_->isOuterLoopJoin() || executor_->isOneToManyOuterHashJoin()) {
-      auto match_found_ptr = executor_->cgen_state_->outer_join_match_found_;
-      CHECK(match_found_ptr);
-      LL_BUILDER.CreateStore(executor_->ll_bool(true), match_found_ptr);
-    }
-
     std::unique_ptr<DiamondCodegen> nonjoin_filter_cfg;
     if (outerjoin_query_filter_result) {
       nonjoin_filter_cfg.reset(new DiamondCodegen(outerjoin_query_filter_result,
@@ -1498,7 +1514,7 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
     }
 
     if (is_group_by) {
-      if (query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::Projection &&
+      if (query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection &&
           !use_streaming_top_n(ra_exe_unit_, query_mem_desc_)) {
         const auto crt_match = get_arg_by_name(ROW_FUNC, "crt_match");
         LL_BUILDER.CreateStore(LL_INT(int32_t(1)), crt_match);
@@ -1522,10 +1538,9 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
 
       auto agg_out_ptr_w_idx = codegenGroupBy(co, filter_cfg);
       if (query_mem_desc.usesGetGroupValueFast() ||
-          query_mem_desc.getGroupByColRangeType() ==
-              GroupByColRangeType::MultiColPerfectHash) {
-        if (query_mem_desc.getGroupByColRangeType() ==
-            GroupByColRangeType::MultiColPerfectHash) {
+          query_mem_desc.getQueryDescriptionType() ==
+              QueryDescriptionType::GroupByPerfectHash) {
+        if (query_mem_desc_.getGroupbyColCount() > 1) {
           filter_cfg.setChainToNext();
         }
         // Don't generate null checks if the group slot is guaranteed to be non-null,
@@ -1533,21 +1548,23 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
         can_return_error = codegenAggCalls(agg_out_ptr_w_idx, {}, co);
       } else {
         {
-          CHECK(!outputColumnar() || query_mem_desc.hasKeylessHash());
+          llvm::Value* nullcheck_cond{nullptr};
+          if (query_mem_desc.didOutputColumnar()) {
+            nullcheck_cond = LL_BUILDER.CreateICmpSGE(std::get<1>(agg_out_ptr_w_idx),
+                                                      LL_INT(int32_t(0)));
+          } else {
+            nullcheck_cond = LL_BUILDER.CreateICmpNE(
+                std::get<0>(agg_out_ptr_w_idx),
+                llvm::ConstantPointerNull::get(
+                    llvm::PointerType::get(get_int_type(64, LL_CONTEXT), 0)));
+          }
           DiamondCodegen nullcheck_cfg(
-              LL_BUILDER.CreateICmpNE(
-                  std::get<0>(agg_out_ptr_w_idx),
-                  llvm::ConstantPointerNull::get(
-                      llvm::PointerType::get(get_int_type(64, LL_CONTEXT), 0))),
-              executor_,
-              false,
-              "groupby_nullcheck",
-              &filter_cfg,
-              false);
+              nullcheck_cond, executor_, false, "groupby_nullcheck", &filter_cfg, false);
           codegenAggCalls(agg_out_ptr_w_idx, {}, co);
         }
         can_return_error = true;
-        if (query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::Projection &&
+        if (query_mem_desc_.getQueryDescriptionType() ==
+                QueryDescriptionType::Projection &&
             use_streaming_top_n(ra_exe_unit_, query_mem_desc_)) {
           // Ignore rejection on pushing current row to top-K heap.
           LL_BUILDER.CreateRet(LL_INT(int32_t(0)));
@@ -1580,8 +1597,8 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
     }
   }
 
-  if (ra_exe_unit_.inner_joins.empty()) {
-    executor_->codegenInnerScanNextRowOrMatch();
+  if (ra_exe_unit_.join_quals.empty()) {
+    executor_->cgen_state_->ir_builder_.CreateRet(LL_INT(int32_t(0)));
   } else if (sc_false) {
     const auto saved_insert_block = LL_BUILDER.GetInsertBlock();
     LL_BUILDER.SetInsertPoint(sc_false);
@@ -1595,7 +1612,7 @@ bool GroupByAndAggregate::codegen(llvm::Value* filter_result,
 llvm::Value* GroupByAndAggregate::codegenOutputSlot(llvm::Value* groups_buffer,
                                                     const CompilationOptions& co,
                                                     DiamondCodegen& diamond_codegen) {
-  CHECK(query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::Projection);
+  CHECK(query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection);
   CHECK_EQ(size_t(1), ra_exe_unit_.groupby_exprs.size());
   const auto group_expr = ra_exe_unit_.groupby_exprs.front();
   CHECK(!group_expr);
@@ -1654,12 +1671,18 @@ llvm::Value* GroupByAndAggregate::codegenOutputSlot(llvm::Value* groups_buffer,
   } else {
     const auto group_expr_lv =
         LL_BUILDER.CreateLoad(get_arg_by_name(ROW_FUNC, "old_total_matched"));
-    return emitCall("get_scan_output_slot",
-                    {groups_buffer,
-                     LL_INT(static_cast<int32_t>(query_mem_desc_.getEntryCount())),
-                     group_expr_lv,
-                     executor_->posArg(nullptr),
-                     LL_INT(row_size_quad)});
+    std::vector<llvm::Value*> args{
+        groups_buffer,
+        LL_INT(static_cast<int32_t>(query_mem_desc_.getEntryCount())),
+        group_expr_lv,
+        executor_->posArg(nullptr)};
+    if (query_mem_desc_.didOutputColumnar()) {
+      const auto columnar_output_offset =
+          emitCall("get_columnar_scan_output_offset", args);
+      return columnar_output_offset;
+    }
+    args.push_back(LL_INT(row_size_quad));
+    return emitCall("get_scan_output_slot", args);
   }
 }
 
@@ -1669,144 +1692,207 @@ std::tuple<llvm::Value*, llvm::Value*> GroupByAndAggregate::codegenGroupBy(
   auto arg_it = ROW_FUNC->arg_begin();
   auto groups_buffer = arg_it++;
 
+  std::stack<llvm::BasicBlock*> array_loops;
+
+  // TODO(Saman): move this logic outside of this function.
+  if (query_mem_desc_.getQueryDescriptionType() == QueryDescriptionType::Projection) {
+    if (query_mem_desc_.didOutputColumnar()) {
+      return std::tuple<llvm::Value*, llvm::Value*>{
+          &*groups_buffer, codegenOutputSlot(&*groups_buffer, co, diamond_codegen)};
+    } else {
+      return std::tuple<llvm::Value*, llvm::Value*>{
+          codegenOutputSlot(&*groups_buffer, co, diamond_codegen), nullptr};
+    }
+  }
+
+  CHECK(query_mem_desc_.getQueryDescriptionType() ==
+            QueryDescriptionType::GroupByBaselineHash ||
+        query_mem_desc_.getQueryDescriptionType() ==
+            QueryDescriptionType::GroupByPerfectHash);
+
   const int32_t row_size_quad =
       outputColumnar() ? 0 : query_mem_desc_.getRowSize() / sizeof(int64_t);
 
-  std::stack<llvm::BasicBlock*> array_loops;
+  const auto col_width_size = query_mem_desc_.isSingleColumnGroupByWithPerfectHash()
+                                  ? sizeof(int64_t)
+                                  : query_mem_desc_.getEffectiveKeyWidth();
+  // for multi-column group by
+  llvm::Value* group_key = nullptr;
+  llvm::Value* key_size_lv = nullptr;
 
-  if (query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::Projection) {
-    return std::tuple<llvm::Value*, llvm::Value*>{
-        codegenOutputSlot(&*groups_buffer, co, diamond_codegen), nullptr};
-  }
-
-  switch (query_mem_desc_.getGroupByColRangeType()) {
-    case GroupByColRangeType::OneColKnownRange:
-    case GroupByColRangeType::Scan: {
-      CHECK_EQ(size_t(1), ra_exe_unit_.groupby_exprs.size());
-      const auto group_expr = ra_exe_unit_.groupby_exprs.front();
-      const auto group_expr_lvs = executor_->groupByColumnCodegen(
-          group_expr.get(),
-          sizeof(int64_t),
-          co,
-          query_mem_desc_.hasNulls(),
-          query_mem_desc_.getMaxVal() +
-              (query_mem_desc_.getBucket() ? query_mem_desc_.getBucket() : 1),
-          diamond_codegen,
-          array_loops,
-          query_mem_desc_.threadsShareMemory());
-      const auto group_expr_lv = group_expr_lvs.translated_value;
-      CHECK(query_mem_desc_.usesGetGroupValueFast());
-      std::string get_group_fn_name{outputColumnar() && !query_mem_desc_.hasKeylessHash()
-                                        ? "get_columnar_group_bin_offset"
-                                        : "get_group_value_fast"};
-      if (query_mem_desc_.hasKeylessHash()) {
-        get_group_fn_name += "_keyless";
-      }
-      if (query_mem_desc_.interleavedBins(co.device_type_)) {
-        CHECK(!outputColumnar());
-        CHECK(query_mem_desc_.hasKeylessHash());
-        get_group_fn_name += "_semiprivate";
-      }
-      std::vector<llvm::Value*> get_group_fn_args{&*groups_buffer, &*group_expr_lv};
-      if (group_expr_lvs.original_value && get_group_fn_name == "get_group_value_fast" &&
-          query_mem_desc_.mustUseBaselineSort()) {
-        get_group_fn_name += "_with_original_key";
-        get_group_fn_args.push_back(group_expr_lvs.original_value);
-      }
-      get_group_fn_args.push_back(LL_INT(query_mem_desc_.getMinVal()));
-      get_group_fn_args.push_back(LL_INT(query_mem_desc_.getBucket()));
-      if (!query_mem_desc_.hasKeylessHash()) {
-        if (!outputColumnar()) {
-          get_group_fn_args.push_back(LL_INT(row_size_quad));
-        }
-      } else {
-        CHECK(!outputColumnar());
-        get_group_fn_args.push_back(LL_INT(row_size_quad));
-        if (query_mem_desc_.interleavedBins(co.device_type_)) {
-          auto warp_idx = emitCall("thread_warp_idx", {LL_INT(executor_->warpSize())});
-          get_group_fn_args.push_back(warp_idx);
-          get_group_fn_args.push_back(LL_INT(executor_->warpSize()));
-        }
-      }
-      if (get_group_fn_name == "get_columnar_group_bin_offset") {
-        return std::make_tuple(&*groups_buffer,
-                               emitCall(get_group_fn_name, get_group_fn_args));
-      }
-      return std::make_tuple(emitCall(get_group_fn_name, get_group_fn_args), nullptr);
-    }
-    case GroupByColRangeType::MultiCol:
-    case GroupByColRangeType::MultiColPerfectHash: {
-      auto key_size_lv =
-          LL_INT(static_cast<int32_t>(query_mem_desc_.groupColWidthsSize()));
-      // create the key buffer
-      const auto key_width = query_mem_desc_.getEffectiveKeyWidth();
-      llvm::Value* group_key =
-          query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::MultiCol &&
-                  key_width == sizeof(int32_t)
+  if (!query_mem_desc_.isSingleColumnGroupByWithPerfectHash()) {
+    key_size_lv = LL_INT(static_cast<int32_t>(query_mem_desc_.groupColWidthsSize()));
+    if (query_mem_desc_.getQueryDescriptionType() ==
+        QueryDescriptionType::GroupByPerfectHash) {
+      group_key =
+          LL_BUILDER.CreateAlloca(llvm::Type::getInt64Ty(LL_CONTEXT), key_size_lv);
+    } else if (query_mem_desc_.getQueryDescriptionType() ==
+               QueryDescriptionType::GroupByBaselineHash) {
+      group_key =
+          col_width_size == sizeof(int32_t)
               ? LL_BUILDER.CreateAlloca(llvm::Type::getInt32Ty(LL_CONTEXT), key_size_lv)
               : LL_BUILDER.CreateAlloca(llvm::Type::getInt64Ty(LL_CONTEXT), key_size_lv);
-      int32_t subkey_idx = 0;
-      for (const auto group_expr : ra_exe_unit_.groupby_exprs) {
-        auto col_range_info = getExprRangeInfo(group_expr.get());
-        const auto group_expr_lvs = executor_->groupByColumnCodegen(
-            group_expr.get(),
-            key_width,
-            co,
-            col_range_info.has_nulls &&
-                query_mem_desc_.getGroupByColRangeType() != GroupByColRangeType::MultiCol,
-            col_range_info.max + (col_range_info.bucket ? col_range_info.bucket : 1),
-            diamond_codegen,
-            array_loops,
-            query_mem_desc_.threadsShareMemory());
-        const auto group_expr_lv = group_expr_lvs.translated_value;
-        // store the sub-key to the buffer
-        LL_BUILDER.CreateStore(group_expr_lv,
-                               LL_BUILDER.CreateGEP(group_key, LL_INT(subkey_idx++)));
-      }
-      ++arg_it;
-      ++arg_it;
-      ++arg_it;
-      auto perfect_hash_func = query_mem_desc_.getGroupByColRangeType() ==
-                                       GroupByColRangeType::MultiColPerfectHash
-                                   ? codegenPerfectHashFunction()
-                                   : nullptr;
-      if (perfect_hash_func) {
-        auto hash_lv = LL_BUILDER.CreateCall(perfect_hash_func,
-                                             std::vector<llvm::Value*>{group_key});
-        return std::make_tuple(emitCall("get_matching_group_value_perfect_hash",
-                                        {&*groups_buffer,
-                                         hash_lv,
-                                         group_key,
-                                         key_size_lv,
-                                         LL_INT(row_size_quad)}),
-                               nullptr);
-      }
-      if (group_key->getType() != llvm::Type::getInt64PtrTy(LL_CONTEXT)) {
-        CHECK(query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::MultiCol &&
-              key_width == sizeof(int32_t));
-        group_key = LL_BUILDER.CreatePointerCast(group_key,
-                                                 llvm::Type::getInt64PtrTy(LL_CONTEXT));
-      }
-      return std::make_tuple(
-          emitCall(co.with_dynamic_watchdog_ ? "get_group_value_with_watchdog"
-                                             : "get_group_value",
-                   {&*groups_buffer,
-                    LL_INT(static_cast<int32_t>(query_mem_desc_.getEntryCount())),
-                    &*group_key,
-                    &*key_size_lv,
-                    LL_INT(static_cast<int32_t>(key_width)),
-                    LL_INT(row_size_quad),
-                    &*(++arg_it)}),
-          nullptr);
-      break;
     }
-    default:
-      CHECK(false);
-      break;
+    CHECK(group_key);
+    CHECK(key_size_lv);
   }
 
+  int32_t subkey_idx = 0;
+  CHECK(query_mem_desc_.getGroupbyColCount() == ra_exe_unit_.groupby_exprs.size());
+  for (const auto group_expr : ra_exe_unit_.groupby_exprs) {
+    const auto col_range_info = getExprRangeInfo(group_expr.get());
+    const auto translated_null_value =
+        query_mem_desc_.isSingleColumnGroupByWithPerfectHash()
+            ? query_mem_desc_.getMaxVal() +
+                  (query_mem_desc_.getBucket() ? query_mem_desc_.getBucket() : 1)
+            : col_range_info.max + (col_range_info.bucket ? col_range_info.bucket : 1);
+
+    const bool col_has_nulls =
+        query_mem_desc_.getQueryDescriptionType() ==
+                QueryDescriptionType::GroupByPerfectHash
+            ? (query_mem_desc_.isSingleColumnGroupByWithPerfectHash()
+                   ? query_mem_desc_.hasNulls()
+                   : col_range_info.has_nulls)
+            : false;
+
+    const auto group_expr_lvs =
+        executor_->groupByColumnCodegen(group_expr.get(),
+                                        col_width_size,
+                                        co,
+                                        col_has_nulls,
+                                        translated_null_value,
+                                        diamond_codegen,
+                                        array_loops,
+                                        query_mem_desc_.threadsShareMemory());
+    const auto group_expr_lv = group_expr_lvs.translated_value;
+    if (query_mem_desc_.isSingleColumnGroupByWithPerfectHash()) {
+      CHECK_EQ(size_t(1), ra_exe_unit_.groupby_exprs.size());
+      return codegenSingleColumnPerfectHash(co,
+                                            &*groups_buffer,
+                                            group_expr_lv,
+                                            group_expr_lvs.original_value,
+                                            row_size_quad);
+    } else {
+      // store the sub-key to the buffer
+      LL_BUILDER.CreateStore(group_expr_lv,
+                             LL_BUILDER.CreateGEP(group_key, LL_INT(subkey_idx++)));
+    }
+  }
+  if (query_mem_desc_.getQueryDescriptionType() ==
+      QueryDescriptionType::GroupByPerfectHash) {
+    CHECK(ra_exe_unit_.groupby_exprs.size() != 1);
+    return codegenMultiColumnPerfectHash(
+        &*groups_buffer, group_key, key_size_lv, row_size_quad);
+  } else if (query_mem_desc_.getQueryDescriptionType() ==
+             QueryDescriptionType::GroupByBaselineHash) {
+    return codegenMultiColumnBaselineHash(
+        co, &*groups_buffer, group_key, key_size_lv, col_width_size, row_size_quad);
+  }
   CHECK(false);
   return std::make_tuple(nullptr, nullptr);
+}
+
+std::tuple<llvm::Value*, llvm::Value*>
+GroupByAndAggregate::codegenSingleColumnPerfectHash(const CompilationOptions& co,
+                                                    llvm::Value* groups_buffer,
+                                                    llvm::Value* group_expr_lv_translated,
+                                                    llvm::Value* group_expr_lv_original,
+                                                    const int32_t row_size_quad) {
+  CHECK(query_mem_desc_.usesGetGroupValueFast());
+  std::string get_group_fn_name{outputColumnar() && !query_mem_desc_.hasKeylessHash()
+                                    ? "get_columnar_group_bin_offset"
+                                    : "get_group_value_fast"};
+  if (query_mem_desc_.hasKeylessHash()) {
+    get_group_fn_name += "_keyless";
+  }
+  if (query_mem_desc_.interleavedBins(co.device_type_)) {
+    CHECK(!outputColumnar());
+    CHECK(query_mem_desc_.hasKeylessHash());
+    get_group_fn_name += "_semiprivate";
+  }
+  std::vector<llvm::Value*> get_group_fn_args{&*groups_buffer,
+                                              &*group_expr_lv_translated};
+  if (group_expr_lv_original && get_group_fn_name == "get_group_value_fast" &&
+      query_mem_desc_.mustUseBaselineSort()) {
+    get_group_fn_name += "_with_original_key";
+    get_group_fn_args.push_back(group_expr_lv_original);
+  }
+  get_group_fn_args.push_back(LL_INT(query_mem_desc_.getMinVal()));
+  get_group_fn_args.push_back(LL_INT(query_mem_desc_.getBucket()));
+  if (!query_mem_desc_.hasKeylessHash()) {
+    if (!outputColumnar()) {
+      get_group_fn_args.push_back(LL_INT(row_size_quad));
+    }
+  } else {
+    CHECK(!outputColumnar());
+    get_group_fn_args.push_back(LL_INT(row_size_quad));
+    if (query_mem_desc_.interleavedBins(co.device_type_)) {
+      auto warp_idx = emitCall("thread_warp_idx", {LL_INT(executor_->warpSize())});
+      get_group_fn_args.push_back(warp_idx);
+      get_group_fn_args.push_back(LL_INT(executor_->warpSize()));
+    }
+  }
+  if (get_group_fn_name == "get_columnar_group_bin_offset") {
+    return std::make_tuple(&*groups_buffer,
+                           emitCall(get_group_fn_name, get_group_fn_args));
+  }
+  return std::make_tuple(emitCall(get_group_fn_name, get_group_fn_args), nullptr);
+}
+
+std::tuple<llvm::Value*, llvm::Value*> GroupByAndAggregate::codegenMultiColumnPerfectHash(
+    llvm::Value* groups_buffer,
+    llvm::Value* group_key,
+    llvm::Value* key_size_lv,
+    const int32_t row_size_quad) {
+  auto perfect_hash_func = codegenPerfectHashFunction();
+  auto hash_lv =
+      LL_BUILDER.CreateCall(perfect_hash_func, std::vector<llvm::Value*>{group_key});
+  return std::make_tuple(
+      emitCall("get_matching_group_value_perfect_hash",
+               {groups_buffer, hash_lv, group_key, key_size_lv, LL_INT(row_size_quad)}),
+      nullptr);
+}
+
+std::tuple<llvm::Value*, llvm::Value*>
+GroupByAndAggregate::codegenMultiColumnBaselineHash(const CompilationOptions& co,
+                                                    llvm::Value* groups_buffer,
+                                                    llvm::Value* group_key,
+                                                    llvm::Value* key_size_lv,
+                                                    const size_t key_width,
+                                                    const int32_t row_size_quad) {
+  auto arg_it = ROW_FUNC->arg_begin();  // groups_buffer
+  ++arg_it;                             // small group buffer
+  ++arg_it;                             // current match count
+  ++arg_it;                             // total match count
+  ++arg_it;                             // old match count
+  ++arg_it;                             // aggregate init values
+  CHECK(arg_it->getName() == "agg_init_val");
+  if (group_key->getType() != llvm::Type::getInt64PtrTy(LL_CONTEXT)) {
+    CHECK(key_width == sizeof(int32_t));
+    group_key =
+        LL_BUILDER.CreatePointerCast(group_key, llvm::Type::getInt64PtrTy(LL_CONTEXT));
+  }
+  std::vector<llvm::Value*> func_args{
+      groups_buffer,
+      LL_INT(static_cast<int32_t>(query_mem_desc_.getEntryCount())),
+      &*group_key,
+      &*key_size_lv,
+      LL_INT(static_cast<int32_t>(key_width))};
+  std::string func_name{"get_group_value"};
+  if (query_mem_desc_.didOutputColumnar()) {
+    func_name += "_columnar_slot";
+  } else {
+    func_args.push_back(LL_INT(row_size_quad));
+    func_args.push_back(&*arg_it);
+  }
+  if (co.with_dynamic_watchdog_) {
+    func_name += "_with_watchdog";
+  }
+  if (query_mem_desc_.didOutputColumnar()) {
+    return std::make_tuple(groups_buffer, emitCall(func_name, func_args));
+  } else {
+    return std::make_tuple(emitCall(func_name, func_args), nullptr);
+  }
 }
 
 llvm::Function* GroupByAndAggregate::codegenPerfectHashFunction() {
@@ -1829,7 +1915,7 @@ llvm::Function* GroupByAndAggregate::codegenPerfectHashFunction() {
   std::vector<int64_t> cardinalities;
   for (const auto groupby_expr : ra_exe_unit_.groupby_exprs) {
     auto col_range_info = getExprRangeInfo(groupby_expr.get());
-    CHECK(col_range_info.hash_type_ == GroupByColRangeType::OneColKnownRange);
+    CHECK(col_range_info.hash_type_ == QueryDescriptionType::GroupByPerfectHash);
     cardinalities.push_back(getBucketedCardinality(col_range_info));
   }
   size_t dim_idx = 0;
@@ -2033,7 +2119,8 @@ bool GroupByAndAggregate::codegenAggCalls(
     if (arg_expr) {
       if (agg_info.agg_kind == kSAMPLE) {
         agg_info.skip_null_val = false;
-      } else if (query_mem_desc_.getGroupByColRangeType() == GroupByColRangeType::Scan) {
+      } else if (query_mem_desc_.getQueryDescriptionType() ==
+                 QueryDescriptionType::NonGroupedAggregate) {
         agg_info.skip_null_val = true;
       } else if (constrained_not_null(arg_expr, ra_exe_unit_.quals)) {
         agg_info.skip_null_val = false;
@@ -2080,10 +2167,7 @@ bool GroupByAndAggregate::codegenAggCalls(
       }
     } else {
       if (agg_has_geo) {
-        if (agg_info.is_agg) {
-          CHECK_EQ(static_cast<size_t>(agg_info.agg_arg_type.get_physical_coord_cols()),
-                   target_lvs.size());
-        } else {
+        if (!agg_info.is_agg) {
           CHECK_EQ(static_cast<size_t>(2 * agg_info.sql_type.get_physical_coord_cols()),
                    target_lvs.size());
           CHECK_EQ(agg_fn_names.size(), target_lvs.size());
@@ -2369,8 +2453,8 @@ void GroupByAndAggregate::codegenEstimator(
   const auto estimator_comp_bytes_lv =
       LL_INT(static_cast<int32_t>(estimator_arg.size() * sizeof(int64_t)));
   const auto bitmap_size_lv =
-      LL_INT(static_cast<uint32_t>(ra_exe_unit_.estimator->getEstimatorBufferSize()));
-  emitCall("linear_probabilistic_count",
+      LL_INT(static_cast<uint32_t>(ra_exe_unit_.estimator->getBufferSize()));
+  emitCall(ra_exe_unit_.estimator->getRuntimeFunctionName(),
            {bitmap, &*bitmap_size_lv, key_bytes, &*estimator_comp_bytes_lv});
 }
 
@@ -2504,32 +2588,45 @@ std::vector<llvm::Value*> GroupByAndAggregate::codegenAggArg(
     }
     if (target_ti.is_geometry() &&
         !executor_->plan_state_->isLazyFetchColumn(target_expr)) {
-      const auto target_lvs =
-          executor_->codegen(target_expr, !executor_->plan_state_->allow_lazy_fetch_, co);
-      CHECK_EQ(target_ti.get_physical_coord_cols(), target_lvs.size());
-      CHECK(!agg_expr);
-      const auto i32_ty = get_int_type(32, executor_->cgen_state_->context_);
-      const auto i8p_ty =
-          llvm::PointerType::get(get_int_type(8, executor_->cgen_state_->context_), 0);
-      std::vector<llvm::Value*> coords;
-      size_t ctr = 0;
-      for (const auto& target_lv : target_lvs) {
-        // TODO(adb): consider adding a utility to sqltypes so we can get the types of
-        // the physical coords cols based on the sqltype (e.g. TINYINT for col 0, INT
-        // for col 1 for pols / mpolys, etc). Hardcoding for now. first array is the
-        // coords array (TINYINT). Subsequent arrays are regular INT.
-        const size_t elem_sz = ctr == 0 ? 1 : 4;
-        ctr++;
-        coords.push_back(executor_->cgen_state_->emitExternalCall(
-            "array_buff", i8p_ty, {target_lv, executor_->posArg(target_expr)}));
-        coords.push_back(executor_->cgen_state_->emitExternalCall(
-            "array_size",
-            i32_ty,
-            {target_lv,
-             executor_->posArg(target_expr),
-             executor_->ll_int(log2_bytes(elem_sz))}));
+      auto generate_coord_lvs = [&](auto* selected_target_expr,
+                                    bool const fetch_columns) -> LLVMValueVector {
+        const auto target_lvs =
+            executor_->codegen(selected_target_expr, fetch_columns, co);
+        CHECK_EQ(target_ti.get_physical_coord_cols(), target_lvs.size());
+
+        const auto i32_ty = get_int_type(32, executor_->cgen_state_->context_);
+        const auto i8p_ty =
+            llvm::PointerType::get(get_int_type(8, executor_->cgen_state_->context_), 0);
+        std::vector<llvm::Value*> coords;
+        size_t ctr = 0;
+        for (const auto& target_lv : target_lvs) {
+          // TODO(adb): consider adding a utility to sqltypes so we can get the types of
+          // the physical coords cols based on the sqltype (e.g. TINYINT for col 0, INT
+          // for col 1 for pols / mpolys, etc). Hardcoding for now. first array is the
+          // coords array (TINYINT). Subsequent arrays are regular INT.
+
+          const size_t elem_sz = ctr == 0 ? 1 : 4;
+          ctr++;
+          coords.push_back(executor_->cgen_state_->emitExternalCall(
+              "array_buff",
+              i8p_ty,
+              {target_lv, executor_->posArg(selected_target_expr)}));
+          coords.push_back(executor_->cgen_state_->emitExternalCall(
+              "array_size",
+              i32_ty,
+              {target_lv,
+               executor_->posArg(selected_target_expr),
+               executor_->ll_int(log2_bytes(elem_sz))}));
+        }
+        return coords;
+      };
+
+      if (agg_expr) {
+        return generate_coord_lvs(agg_expr->get_arg(), true);
+      } else {
+        return generate_coord_lvs(target_expr,
+                                  !executor_->plan_state_->allow_lazy_fetch_);
       }
-      return coords;
     }
   }
   return agg_expr ? executor_->codegen(agg_expr->get_arg(), true, co)

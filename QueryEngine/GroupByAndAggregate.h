@@ -22,7 +22,6 @@
 #include "CompilationOptions.h"
 #include "GpuMemUtils.h"
 #include "InputMetadata.h"
-#include "IteratorTable.h"
 #include "QueryExecutionContext.h"
 #include "Rendering/RenderInfo.h"
 #include "RuntimeFunctions.h"
@@ -105,7 +104,7 @@ inline std::string datum_to_string(const TargetValue& tv,
 }
 
 struct ColRangeInfo {
-  const GroupByColRangeType hash_type_;
+  const QueryDescriptionType hash_type_;
   const int64_t min;
   const int64_t max;
   const int64_t bucket;
@@ -180,7 +179,8 @@ class GroupByAndAggregate {
                                  const int8_t crt_min_byte_width,
                                  const bool sort_on_gpu_hint,
                                  RenderInfo* render_info,
-                                 const bool must_use_baseline_sort);
+                                 const bool must_use_baseline_sort,
+                                 const bool output_columnar_hint);
 
   int64_t getShardedTopBucket(const ColRangeInfo& col_range_info,
                               const size_t shard_count) const;
@@ -196,7 +196,27 @@ class GroupByAndAggregate {
   std::tuple<llvm::Value*, llvm::Value*> codegenGroupBy(const CompilationOptions& co,
                                                         DiamondCodegen& codegen);
 
+  std::tuple<llvm::Value*, llvm::Value*> codegenSingleColumnPerfectHash(
+      const CompilationOptions& co,
+      llvm::Value* groups_buffer,
+      llvm::Value* group_expr_lv_translated,
+      llvm::Value* group_expr_lv_original,
+      const int32_t row_size_quad);
+
+  std::tuple<llvm::Value*, llvm::Value*> codegenMultiColumnPerfectHash(
+      llvm::Value* groups_buffer,
+      llvm::Value* group_key,
+      llvm::Value* key_size_lv,
+      const int32_t row_size_quad);
   llvm::Function* codegenPerfectHashFunction();
+
+  std::tuple<llvm::Value*, llvm::Value*> codegenMultiColumnBaselineHash(
+      const CompilationOptions& co,
+      llvm::Value* groups_buffer,
+      llvm::Value* group_key,
+      llvm::Value* key_size_lv,
+      const size_t key_width,
+      const int32_t row_size_quad);
 
   ColRangeInfo getColRangeInfo();
 

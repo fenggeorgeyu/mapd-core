@@ -3,6 +3,8 @@
 set -e
 set -x
 
+HTTP_DEPS="https://dependencies.mapd.com/thirdparty"
+
 PREFIX=/usr/local/mapd-deps
 
 SCRIPTS_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -42,7 +44,6 @@ sudo apt install -y \
     google-perftools \
     libdouble-conversion-dev \
     libevent-dev \
-    libgdal-dev \
     libgflags-dev \
     libgoogle-perftools-dev \
     libiberty-dev \
@@ -60,7 +61,27 @@ sudo apt install -y \
     autoconf-archive \
     automake \
     bison \
-    flex-old
+    flex-old \
+    libpng-dev \
+    rsync \
+    unzip
+
+# GEO STUFF
+# expat
+download_make_install https://github.com/libexpat/libexpat/releases/download/R_2_2_5/expat-2.2.5.tar.bz2
+# kml
+download ${HTTP_DEPS}/libkml-master.zip
+unzip -u libkml-master.zip
+pushd libkml-master
+./autogen.sh || true
+CXXFLAGS="-std=c++03" ./configure --with-expat-include-dir=$PREFIX/include/ --with-expat-lib-dir=$PREFIX/lib --prefix=$PREFIX --enable-static --disable-java --disable-python --disable-swig
+makej
+make install
+popd
+# proj.4
+download_make_install ${HTTP_DEPS}/proj-5.2.0.tar.gz
+# gdal
+download_make_install ${HTTP_DEPS}/gdal-2.3.2.tar.xz "" "--without-geos --with-libkml=$PREFIX --with-proj=$PREFIX"
 
 # install AWS core and s3 sdk
 install_awscpp -j $(nproc)
@@ -124,8 +145,8 @@ popd
 ARROW_BOOST_USE_SHARED="ON"
 install_arrow
 
-VERS=2.1.4_egl
-wget --continue https://github.com/vastcharade/glbinding/archive/v$VERS.tar.gz
+VERS=3.0.2
+wget --continue https://github.com/cginternals/glbinding/archive/v$VERS.tar.gz
 tar xvf v$VERS.tar.gz
 mkdir -p glbinding-$VERS/build
 pushd glbinding-$VERS/build
@@ -143,6 +164,37 @@ make -j $(nproc)
 make install
 popd
 
+# glslang (with spirv-tools)
+VERS=7.9.2888 # 8/13/18
+rm -rf glslang
+mkdir -p glslang
+pushd glslang
+wget --continue https://github.com/KhronosGroup/glslang/archive/$VERS.tar.gz
+tar xvf $VERS.tar.gz
+pushd glslang-$VERS
+./update_glslang_sources.py
+mkdir build
+pushd build
+cmake \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    ..
+make -j $(nproc)
+make install
+popd # build
+popd # glslang-$VERS
+popd # glslang
+
+# Vulkan
+VERS=1.1.82.1 # 8/20/18
+rm -rf vulkan
+mkdir -p vulkan
+pushd vulkan
+wget --continue https://vulkan.lunarg.com/sdk/download/$VERS/linux/vulkansdk-linux-x86_64-$VERS.tar.gz?Human=true -O vulkansdk-linux-x86_64-$VERS.tar.gz
+tar xvf vulkansdk-linux-x86_64-$VERS.tar.gz
+rsync -av $VERS/x86_64/* $PREFIX
+popd # vulkan
+
 cat > $PREFIX/mapd-deps.sh <<EOF
 PREFIX=$PREFIX
 
@@ -153,7 +205,10 @@ LD_LIBRARY_PATH=\$PREFIX/lib64:\$LD_LIBRARY_PATH
 PATH=/usr/local/cuda/bin:\$PATH
 PATH=\$PREFIX/bin:\$PATH
 
-export LD_LIBRARY_PATH PATH
+VULKAN_SDK=\$PREFIX
+VK_LAYER_PATH=\$PREFIX/etc/explicit_layer.d
+
+export LD_LIBRARY_PATH PATH VULKAN_SDK VK_LAYER_PATH
 EOF
 
 echo

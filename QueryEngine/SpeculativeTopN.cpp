@@ -90,12 +90,13 @@ void SpeculativeTopNMap::reduce(SpeculativeTopNMap& that) {
   unknown_ += that.unknown_;
 }
 
-RowSetPtr SpeculativeTopNMap::asRows(const RelAlgExecutionUnit& ra_exe_unit,
-                                     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
-                                     const QueryMemoryDescriptor& query_mem_desc,
-                                     const Executor* executor,
-                                     const size_t top_n,
-                                     const bool desc) const {
+std::shared_ptr<ResultSet> SpeculativeTopNMap::asRows(
+    const RelAlgExecutionUnit& ra_exe_unit,
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+    const QueryMemoryDescriptor& query_mem_desc,
+    const Executor* executor,
+    const size_t top_n,
+    const bool desc) const {
   std::vector<SpeculativeTopNEntry> vec;
   for (const auto& kv : map_) {
     vec.emplace_back(SpeculativeTopNEntry{kv.first, kv.second.val, kv.second.unknown});
@@ -113,7 +114,7 @@ RowSetPtr SpeculativeTopNMap::asRows(const RelAlgExecutionUnit& ra_exe_unit,
   }
   CHECK_EQ(size_t(2), ra_exe_unit.target_exprs.size());
   auto query_mem_desc_rs = query_mem_desc;
-  query_mem_desc_rs.setGroupByColRangeType(GroupByColRangeType::MultiCol);
+  query_mem_desc_rs.setQueryDescriptionType(QueryDescriptionType::GroupByBaselineHash);
   query_mem_desc_rs.setOutputColumnar(false);
   query_mem_desc_rs.setEntryCount(num_rows);
   query_mem_desc_rs.clearAggColWidths();

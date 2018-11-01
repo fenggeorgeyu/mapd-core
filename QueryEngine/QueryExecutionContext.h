@@ -20,8 +20,8 @@
 #include "CompilationOptions.h"
 #include "CudaAllocator.h"
 #include "GpuMemUtils.h"
-#include "IteratorTable.h"
 #include "Rendering/RenderInfo.h"
+#include "ResultSet.h"
 
 #include <boost/core/noncopyable.hpp>
 #include <vector>
@@ -47,17 +47,10 @@ class QueryExecutionContext : boost::noncopyable {
                         const bool sort_on_gpu,
                         RenderInfo*);
 
-  ResultPtr getResult(const RelAlgExecutionUnit& ra_exe_unit,
-                      const std::vector<size_t>& outer_tab_frag_ids) const;
-
-  // TOOD(alex): get rid of targets parameter
-  RowSetPtr getRowSet(const RelAlgExecutionUnit& ra_exe_unit,
-                      const QueryMemoryDescriptor& query_mem_desc) const;
-  RowSetPtr groupBufferToResults(const size_t i,
-                                 const std::vector<Analyzer::Expr*>& targets) const;
-
-  IterTabPtr getIterTab(const std::vector<Analyzer::Expr*>& targets,
-                        const ssize_t frag_idx) const;
+  ResultSetPtr getRowSet(const RelAlgExecutionUnit& ra_exe_unit,
+                         const QueryMemoryDescriptor& query_mem_desc) const;
+  ResultSetPtr groupBufferToResults(const size_t i,
+                                    const std::vector<Analyzer::Expr*>& targets) const;
 
   std::vector<int64_t*> launchGpuCode(
       const RelAlgExecutionUnit& ra_exe_unit,
@@ -106,11 +99,11 @@ class QueryExecutionContext : boost::noncopyable {
   void initColumnPerRow(const QueryMemoryDescriptor& query_mem_desc,
                         int8_t* row_ptr,
                         const size_t bin,
-                        const int64_t* init_vals,
+                        const std::vector<int64_t>& init_vals,
                         const std::vector<ssize_t>& bitmap_sizes);
 
   void initGroups(int64_t* groups_buffer,
-                  const int64_t* init_vals,
+                  const std::vector<int64_t>& init_vals,
                   const int32_t groups_buffer_entry_count,
                   const bool keyless,
                   const size_t warp_size);
@@ -119,13 +112,9 @@ class QueryExecutionContext : boost::noncopyable {
   int8_t* initColumnarBuffer(T* buffer_ptr, const T init_val, const uint32_t entry_count);
 
   void initColumnarGroups(int64_t* groups_buffer,
-                          const int64_t* init_vals,
+                          const std::vector<int64_t>& init_vals,
                           const int32_t groups_buffer_entry_count,
                           const bool keyless);
-
-  IterTabPtr groupBufferToTab(const size_t buf_idx,
-                              const ssize_t frag_idx,
-                              const std::vector<Analyzer::Expr*>& targets) const;
 
   uint32_t getFragmentStride(
       const RelAlgExecutionUnit& ra_exe_unit,
@@ -195,7 +184,7 @@ class QueryExecutionContext : boost::noncopyable {
 
   void allocateCountDistinctGpuMem();
 
-  RowSetPtr groupBufferToDeinterleavedResults(const size_t i) const;
+  ResultSetPtr groupBufferToDeinterleavedResults(const size_t i) const;
 
   const QueryMemoryDescriptor& query_mem_desc_;
   std::vector<int64_t> init_agg_vals_;
@@ -222,6 +211,11 @@ class QueryExecutionContext : boost::noncopyable {
   size_t count_distinct_bitmap_mem_bytes_;
 
   friend class Executor;
+
+  // Temporary; Reduction egress needs to become part of executor
+  template <typename META_CLASS_TYPE>
+  friend class AggregateReductionEgress;
+
   friend void copy_group_by_buffers_from_gpu(
       Data_Namespace::DataMgr* data_mgr,
       const QueryExecutionContext* query_exe_context,

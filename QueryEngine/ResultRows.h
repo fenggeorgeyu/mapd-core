@@ -27,7 +27,6 @@
 #include "HyperLogLog.h"
 #include "OutputBufferInitialization.h"
 #include "QueryMemoryDescriptor.h"
-#include "ResultSet.h"
 #include "TargetValue.h"
 
 #include "../Analyzer/Analyzer.h"
@@ -188,6 +187,7 @@ inline std::vector<std::vector<int64_t>> get_col_frag_offsets(
 typedef std::vector<int64_t> ValueTuple;
 
 class ChunkIter;
+class ResultSet;
 
 class RowSetMemoryOwner : boost::noncopyable {
  public:
@@ -364,7 +364,8 @@ inline std::vector<TargetInfo> target_exprs_to_infos(
   std::vector<TargetInfo> target_infos;
   for (const auto target_expr : targets) {
     auto target = target_info(target_expr);
-    if (query_mem_desc.getGroupByColRangeType() == GroupByColRangeType::Scan) {
+    if (query_mem_desc.getQueryDescriptionType() ==
+        QueryDescriptionType::NonGroupedAggregate) {
       set_notnull(target, false);
       target.sql_type.set_notnull(false);
     }
@@ -392,17 +393,5 @@ class ResultRows {
                               const std::vector<TargetInfo>& targets,
                               const std::vector<int64_t>& agg_init_vals);
 };
-
-// TODO(miyu): make some uses of this pointer able to
-// hold iterator table as well and move decls elsewhere
-typedef std::shared_ptr<ResultSet> RowSetPtr;
-
-inline bool can_use_parallel_algorithms(const ResultSet& rows) {
-  return !rows.isTruncated();
-}
-
-inline bool use_parallel_algorithms(const ResultSet& rows) {
-  return can_use_parallel_algorithms(rows) && rows.entryCount() >= 20000;
-}
 
 #endif  // QUERYENGINE_RESULTROWS_H

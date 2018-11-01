@@ -18,6 +18,8 @@
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/topological_sort.hpp>
 
+extern bool g_multi_subquery_exc;
+
 namespace {
 
 typedef boost::
@@ -110,6 +112,20 @@ DAG build_dag(const RelAlgNode* sink) {
           (input_num > 2 && (dynamic_cast<const RelLeftDeepInnerJoin*>(node))));
     for (size_t i = 0; i < input_num; ++i) {
       const auto input = node->getInput(i);
+      const auto rel_join = dynamic_cast<const RelJoin*>(node);
+      const auto rel_left_deep_join = dynamic_cast<const RelLeftDeepInnerJoin*>(node);
+      if ((rel_join || rel_left_deep_join) && g_multi_subquery_exc) {
+        // If the input to the join node is something other than RelJoin or RelScan we
+        // don't schedule it to run now as we form a subquery out of the sequence and
+        // schedule it separately. See create_implicit_subquery_node of
+        // RelAlgAbstractInterpreter.cpp. We do it becasue we would like to consturct a
+        // subquery of all the imputs of a join which are not RelScan or RelJoin. Because
+        // we might need to broadcast those intermediate results to other leaves.
+        if (!(dynamic_cast<const RelScan*>(input) ||
+              dynamic_cast<const RelJoin*>(input))) {
+          continue;
+        }
+      }
       CHECK(input);
       const bool visited = node_ptr_to_vert_idx.count(input) > 0;
       if (!visited) {
@@ -154,18 +170,6 @@ std::vector<RaExecutionDesc> get_execution_descriptors(const RelAlgNode* ra_node
     if (dynamic_cast<const RelScan*>(node)) {
       continue;
     }
-    CHECK_GE(node->inputCount(), size_t(0));
-#ifdef ENABLE_JOIN_EXEC
-    CHECK((dynamic_cast<const RelJoin*>(node) && 2 == node->inputCount()) ||
-          (dynamic_cast<const RelModify*>(node) && 1 == node->inputCount()) ||
-          (dynamic_cast<const RelLogicalValues*>(node) && node->inputCount() == 0) ||
-          dynamic_cast<const RelLeftDeepInnerJoin*>(node) || (1 == node->inputCount()));
-#else
-    if (dynamic_cast<const RelJoin*>(node)) {
-      throw std::runtime_error("3+-way join not supported yet");
-    }
-    CHECK_EQ(size_t(1), node->inputCount());
-#endif
     descs.emplace_back(node);
   }
 
@@ -182,10 +186,6 @@ std::vector<RaExecutionDesc> get_execution_descriptors(
       continue;
     }
     CHECK_GT(node->inputCount(), size_t(0));
-#ifdef ENABLE_JOIN_EXEC
-    CHECK((dynamic_cast<const RelJoin*>(node) && 2 == node->inputCount()) ||
-          (1 == node->inputCount()));
-#endif
     descs.emplace_back(node);
   }
 

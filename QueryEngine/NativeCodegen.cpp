@@ -143,18 +143,17 @@ std::string serialize_llvm_object(const T* llvm_obj) {
 
 }  // namespace
 
-std::vector<std::pair<void*, void*>> Executor::getCodeFromCache(
-    const CodeCacheKey& key,
-    const std::map<CodeCacheKey, std::pair<CodeCacheVal, llvm::Module*>>& cache) {
+std::vector<std::pair<void*, void*>> Executor::getCodeFromCache(const CodeCacheKey& key,
+                                                                const CodeCache& cache) {
   auto it = cache.find(key);
-  if (it != cache.end()) {
+  if (it != cache.cend()) {
     delete cgen_state_->module_;
     cgen_state_->module_ = it->second.second;
     std::vector<std::pair<void*, void*>> native_functions;
     for (auto& native_code : it->second.first) {
       GpuCompilationContext* gpu_context = std::get<2>(native_code).get();
-      native_functions.push_back(std::make_pair(
-          std::get<0>(native_code), gpu_context ? gpu_context->module() : nullptr));
+      native_functions.emplace_back(std::get<0>(native_code),
+                                    gpu_context ? gpu_context->module() : nullptr);
     }
     return native_functions;
   }
@@ -166,7 +165,7 @@ void Executor::addCodeToCache(
     const std::vector<std::tuple<void*, llvm::ExecutionEngine*, GpuCompilationContext*>>&
         native_code,
     llvm::Module* module,
-    std::map<CodeCacheKey, std::pair<CodeCacheVal, llvm::Module*>>& cache) {
+    CodeCache& cache) {
   CHECK(!native_code.empty());
   CodeCacheVal cache_val;
   for (const auto& native_func : native_code) {
@@ -175,9 +174,9 @@ void Executor::addCodeToCache(
         std::unique_ptr<llvm::ExecutionEngine>(std::get<1>(native_func)),
         std::unique_ptr<GpuCompilationContext>(std::get<2>(native_func)));
   }
-  auto it_ok =
-      cache.insert(std::make_pair(key, std::make_pair(std::move(cache_val), module)));
-  CHECK(it_ok.second);
+  cache.put(key,
+            std::make_pair<decltype(cache_val), decltype(module)>(std::move(cache_val),
+                                                                  std::move(module)));
 }
 
 std::vector<std::pair<void*, void*>> Executor::optimizeAndCodegenCPU(
@@ -311,6 +310,8 @@ declare void @agg_from_smem_to_gmem_count_binId(i64*, i64*, i32);
 declare void @init_group_by_buffer_gpu(i64*, i64*, i32, i32, i32, i1, i8);
 declare i64* @get_group_value(i64*, i32, i64*, i32, i32, i32, i64*);
 declare i64* @get_group_value_with_watchdog(i64*, i32, i64*, i32, i32, i32, i64*);
+declare i32 @get_group_value_columnar_slot(i64*, i32, i64*, i32, i32);
+declare i32 @get_group_value_columnar_slot_with_watchdog(i64*, i32, i64*, i32, i32);
 declare i64* @get_group_value_fast(i64*, i64, i64, i64, i32);
 declare i64* @get_group_value_fast_with_original_key(i64*, i64, i64, i64, i64, i32);
 declare i32 @get_columnar_group_bin_offset(i64*, i64, i64, i64);
@@ -363,6 +364,8 @@ declare i64 @DateTruncate(i32, i64);
 declare i64 @DateTruncateNullable(i32, i64, i64);
 declare i64 @DateTruncateHighPrecision(i32, i64, i32);
 declare i64 @DateTruncateHighPrecisionNullable(i32, i64, i32, i64);
+declare i64 @DateTruncateAlterPrecision(i32, i64, i32, i32);
+declare i64 @DateTruncateAlterPrecisionNullable(i32, i64, i32, i32, i64);
 declare i64 @DateDiff(i32, i64, i64, i32, i32);
 declare i64 @DateDiffNullable(i32, i64, i64, i32, i32, i64);
 declare i64 @DateAdd(i32, i64, i64, i32);
@@ -584,7 +587,7 @@ std::vector<std::pair<void*, void*>> Executor::optimizeAndCodegenGPU(
     auto native_module = gpu_context->module();
     CHECK(native_code);
     CHECK(native_module);
-    native_functions.push_back(std::make_pair(native_code, native_module));
+    native_functions.emplace_back(native_code, native_module);
     cached_functions.emplace_back(native_code, nullptr, gpu_context);
   }
   addCodeToCache(key, cached_functions, module, gpu_code_cache_);
@@ -893,14 +896,14 @@ std::vector<std::string> get_agg_fnames(const std::vector<Analyzer::Expr*>& targ
          target_type_info.get_compression() == kENCODING_NONE) ||
         target_type_info.is_array();  // TODO: should it use is_varlen_array() ?
     if (!agg_expr || agg_expr->get_aggtype() == kSAMPLE) {
-      result.push_back(target_type_info.is_fp() ? "agg_id_double" : "agg_id");
+      result.emplace_back(target_type_info.is_fp() ? "agg_id_double" : "agg_id");
       if (is_varlen) {
-        result.push_back("agg_id");
+        result.emplace_back("agg_id");
       }
       if (target_type_info.is_geometry()) {
-        result.push_back("agg_id");
-        for (auto i = 1; i < 2 * target_type_info.get_physical_coord_cols(); ++i) {
-          result.push_back("agg_id");
+        result.emplace_back("agg_id");
+        for (auto i = 2; i < 2 * target_type_info.get_physical_coord_cols(); ++i) {
+          result.emplace_back("agg_id");
         }
       }
       continue;
@@ -914,30 +917,34 @@ std::vector<std::string> get_agg_fnames(const std::vector<Analyzer::Expr*>& targ
             !agg_type_info.is_fp()) {
           throw std::runtime_error("AVG is only valid on integer and floating point");
         }
-        result.push_back((agg_type_info.is_integer() || agg_type_info.is_time())
-                             ? "agg_sum"
-                             : "agg_sum_double");
-        result.push_back((agg_type_info.is_integer() || agg_type_info.is_time())
-                             ? "agg_count"
-                             : "agg_count_double");
+        result.emplace_back((agg_type_info.is_integer() || agg_type_info.is_time())
+                                ? "agg_sum"
+                                : "agg_sum_double");
+        result.emplace_back((agg_type_info.is_integer() || agg_type_info.is_time())
+                                ? "agg_count"
+                                : "agg_count_double");
         break;
       }
       case kMIN: {
-        if (agg_type_info.is_string() || agg_type_info.is_array()) {
-          throw std::runtime_error("MIN on strings or arrays not supported yet");
+        if (agg_type_info.is_string() || agg_type_info.is_array() ||
+            agg_type_info.is_geometry()) {
+          throw std::runtime_error(
+              "MIN on strings, arrays or geospatial types not supported yet");
         }
-        result.push_back((agg_type_info.is_integer() || agg_type_info.is_time())
-                             ? "agg_min"
-                             : "agg_min_double");
+        result.emplace_back((agg_type_info.is_integer() || agg_type_info.is_time())
+                                ? "agg_min"
+                                : "agg_min_double");
         break;
       }
       case kMAX: {
-        if (agg_type_info.is_string() || agg_type_info.is_array()) {
-          throw std::runtime_error("MAX on strings or arrays not supported yet");
+        if (agg_type_info.is_string() || agg_type_info.is_array() ||
+            agg_type_info.is_geometry()) {
+          throw std::runtime_error(
+              "MAX on strings, arrays or geospatial types not supported yet");
         }
-        result.push_back((agg_type_info.is_integer() || agg_type_info.is_time())
-                             ? "agg_max"
-                             : "agg_max_double");
+        result.emplace_back((agg_type_info.is_integer() || agg_type_info.is_time())
+                                ? "agg_max"
+                                : "agg_max_double");
         break;
       }
       case kSUM: {
@@ -945,14 +952,14 @@ std::vector<std::string> get_agg_fnames(const std::vector<Analyzer::Expr*>& targ
             !agg_type_info.is_fp()) {
           throw std::runtime_error("SUM is only valid on integer and floating point");
         }
-        result.push_back((agg_type_info.is_integer() || agg_type_info.is_time())
-                             ? "agg_sum"
-                             : "agg_sum_double");
+        result.emplace_back((agg_type_info.is_integer() || agg_type_info.is_time())
+                                ? "agg_sum"
+                                : "agg_sum_double");
         break;
       }
       case kCOUNT:
-        result.push_back(agg_expr->get_is_distinct() ? "agg_count_distinct"
-                                                     : "agg_count");
+        result.emplace_back(agg_expr->get_is_distinct() ? "agg_count_distinct"
+                                                        : "agg_count");
         break;
       case kSAMPLE: {
         if ((agg_type_info.is_string() &&
@@ -961,11 +968,11 @@ std::vector<std::string> get_agg_fnames(const std::vector<Analyzer::Expr*>& targ
           throw std::runtime_error(
               "SAMPLE on none encoded strings or arrays not supported yet");
         }
-        result.push_back(agg_type_info.is_fp() ? "agg_id_double" : "agg_id");
+        result.emplace_back(agg_type_info.is_fp() ? "agg_id_double" : "agg_id");
         break;
       }
       case kAPPROX_COUNT_DISTINCT:
-        result.push_back("agg_approximate_count_distinct");
+        result.emplace_back("agg_approximate_count_distinct");
         break;
       default:
         CHECK(false);
@@ -1232,21 +1239,21 @@ Executor::CompilationResult Executor::compileWorkUnit(
   nukeOldState(allow_lazy_fetch, join_info, query_infos, ra_exe_unit);
   OOM_TRACE_PUSH(+": " + (co.device_type_ == ExecutorDeviceType::GPU ? "gpu" : "cpu"));
 
-  GroupByAndAggregate group_by_and_aggregate(
-      this,
-      co.device_type_,
-      ra_exe_unit,
-      render_info,
-      query_infos,
-      row_set_mem_owner,
-      max_groups_buffer_entry_guess,
-      small_groups_buffer_entry_count,
-      crt_min_byte_width,
-      eo.allow_multifrag,
-      eo.output_columnar_hint && co.device_type_ == ExecutorDeviceType::GPU);
+  GroupByAndAggregate group_by_and_aggregate(this,
+                                             co.device_type_,
+                                             ra_exe_unit,
+                                             render_info,
+                                             query_infos,
+                                             row_set_mem_owner,
+                                             max_groups_buffer_entry_guess,
+                                             small_groups_buffer_entry_count,
+                                             crt_min_byte_width,
+                                             eo.allow_multifrag,
+                                             eo.output_columnar_hint);
   const auto& query_mem_desc = group_by_and_aggregate.getQueryMemoryDescriptor();
 
-  if (query_mem_desc.getGroupByColRangeType() == GroupByColRangeType::MultiCol &&
+  if (query_mem_desc.getQueryDescriptionType() ==
+          QueryDescriptionType::GroupByBaselineHash &&
       !has_cardinality_estimation &&
       (!render_info || !render_info->isPotentialInSituRender()) && !eo.just_explain) {
     throw CardinalityEstimationRequired();
@@ -1269,8 +1276,9 @@ Executor::CompilationResult Executor::compileWorkUnit(
   }
 
   if (co.device_type_ == ExecutorDeviceType::GPU &&
-      query_mem_desc.getGroupByColRangeType() ==
-          GroupByColRangeType::MultiColPerfectHash) {
+      query_mem_desc.getQueryDescriptionType() ==
+          QueryDescriptionType::GroupByPerfectHash &&
+      query_mem_desc.getGroupbyColCount() > 1) {
     const auto grid_size = query_mem_desc.blocksShareMemory() ? 1 : gridSize();
     const size_t required_memory{
         (grid_size * query_mem_desc.getBufferSizeBytes(ExecutorDeviceType::GPU))};
@@ -1490,42 +1498,8 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
             << " quals";
   }
 
-  primary_quals = codegenHashJoinsBeforeLoopJoin(primary_quals, ra_exe_unit, co);
-
-  if (ra_exe_unit.inner_joins.empty()) {
-    allocateInnerScansIterators(ra_exe_unit.input_descs);
-  }
-
-  llvm::Value* outer_join_nomatch_flag_lv = nullptr;
-  if (isOuterJoin()) {
-    if (isOuterLoopJoin()) {
-      CHECK(cgen_state_->outer_join_nomatch_);
-      outer_join_nomatch_flag_lv =
-          cgen_state_->ir_builder_.CreateLoad(cgen_state_->outer_join_nomatch_);
-      cgen_state_->outer_join_cond_lv_ =
-          cgen_state_->ir_builder_.CreateNot(outer_join_nomatch_flag_lv);
-    } else {
-      cgen_state_->outer_join_cond_lv_ = ll_bool(true);
-    }
-    for (auto expr : ra_exe_unit.outer_join_quals) {
-      cgen_state_->outer_join_cond_lv_ = cgen_state_->ir_builder_.CreateAnd(
-          cgen_state_->outer_join_cond_lv_,
-          toBool(codegen(expr.get(), true, co).front()));
-    }
-    if (isOneToManyOuterHashJoin()) {
-      CHECK(cgen_state_->outer_join_nomatch_);
-      // TODO(miyu): Support more than 1 one-to-many hash joins in folded sequence.
-      outer_join_nomatch_flag_lv =
-          cgen_state_->ir_builder_.CreateLoad(cgen_state_->outer_join_nomatch_);
-    }
-  }
-
-  llvm::Value* filter_lv = isOuterLoopJoin() || isOneToManyOuterHashJoin()
-                               ? cgen_state_->outer_join_cond_lv_
-                               : ll_bool(true);
-  llvm::Value* outerjoin_query_filter_lv =
-      (!primary_quals.empty() && (isOuterJoin() || isOuterLoopJoin())) ? ll_bool(true)
-                                                                       : nullptr;
+  llvm::Value* filter_lv = ll_bool(true);
+  llvm::Value* outerjoin_query_filter_lv = nullptr;
   for (auto expr : primary_quals) {
     // Generate the filter for primary quals
     auto cond = toBool(codegen(expr, true, co).front());
@@ -1546,14 +1520,10 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
         cgen_state_->context_, "sc_true", cgen_state_->row_func_);
     sc_false = llvm::BasicBlock::Create(
         cgen_state_->context_, "sc_false", cgen_state_->row_func_);
-    if (isOuterLoopJoin() || isOneToManyOuterHashJoin()) {
-      filter_lv =
-          cgen_state_->ir_builder_.CreateOr(filter_lv, outer_join_nomatch_flag_lv);
-    }
     cgen_state_->ir_builder_.CreateCondBr(filter_lv, sc_true, sc_false);
     cgen_state_->ir_builder_.SetInsertPoint(sc_false);
-    if (ra_exe_unit.inner_joins.empty()) {
-      codegenInnerScanNextRowOrMatch();
+    if (ra_exe_unit.join_quals.empty()) {
+      cgen_state_->ir_builder_.CreateRet(ll_int(int32_t(0)));
     }
     cgen_state_->ir_builder_.SetInsertPoint(sc_true);
     filter_lv = ll_bool(true);
@@ -1562,10 +1532,6 @@ bool Executor::compileBody(const RelAlgExecutionUnit& ra_exe_unit,
   for (auto expr : deferred_quals) {
     filter_lv = cgen_state_->ir_builder_.CreateAnd(
         filter_lv, toBool(codegen(expr, true, co).front()));
-  }
-  if (isOuterLoopJoin() || isOneToManyOuterHashJoin()) {
-    CHECK(outer_join_nomatch_flag_lv);
-    filter_lv = cgen_state_->ir_builder_.CreateOr(filter_lv, outer_join_nomatch_flag_lv);
   }
 
   CHECK(filter_lv->getType()->isIntegerTy(1));

@@ -34,6 +34,7 @@
 #include "CudaMgr/CudaMgr.h"
 #include "DataMgr/BufferMgr/BufferMgr.h"
 #include "Parser/ParserNode.h"
+#include "Shared/ExperimentalTypeUtilities.h"
 #include "Shared/MapDParameters.h"
 #include "Shared/checked_alloc.h"
 #include "Shared/measure.h"
@@ -64,7 +65,6 @@ unsigned g_dynamic_watchdog_time_limit{10000};
 bool g_allow_cpu_retry{false};
 bool g_null_div_by_zero{false};
 unsigned g_trivial_loop_join_threshold{1000};
-bool g_left_deep_join_optimization{true};
 bool g_from_table_reordering{true};
 bool g_inner_join_fragment_skipping{false};
 extern bool g_enable_smem_group_by;
@@ -73,6 +73,8 @@ bool g_enable_filter_push_down{false};
 float g_filter_push_down_low_frac{-1.0f};
 float g_filter_push_down_high_frac{-1.0f};
 size_t g_filter_push_down_passing_row_ubound{0};
+bool g_multi_subquery_exc{true};
+bool g_enable_columnar_output{false};
 
 Executor::Executor(const int db_id,
                    const size_t block_size_x,
@@ -80,10 +82,12 @@ Executor::Executor(const int db_id,
                    const std::string& debug_dir,
                    const std::string& debug_file,
                    ::QueryRenderer::QueryRenderManager* render_manager)
-    : cgen_state_(new CgenState({}, false, false))
+    : cgen_state_(new CgenState({}, false))
     , is_nested_(false)
     , gpu_active_modules_device_mask_(0x0)
     , interrupted_(false)
+    , cpu_code_cache_(code_cache_size)
+    , gpu_code_cache_(code_cache_size)
     , render_manager_(render_manager)
     , block_size_x_(block_size_x)
     , grid_size_x_(grid_size_x)
@@ -460,8 +464,7 @@ int Executor::deviceCount(const ExecutorDeviceType device_type) const {
 }
 
 llvm::ConstantInt* Executor::inlineIntNull(const SQLTypeInfo& type_info) {
-  auto type =
-      type_info.is_decimal() ? decimal_to_int_type(type_info) : type_info.get_type();
+  auto type = type_info.get_type();
   if (type_info.is_string()) {
     switch (type_info.get_compression()) {
       case kENCODING_DICT:
@@ -487,6 +490,9 @@ llvm::ConstantInt* Executor::inlineIntNull(const SQLTypeInfo& type_info) {
     case kDATE:
     case kINTERVAL_DAY_TIME:
     case kINTERVAL_YEAR_MONTH:
+      return ll_int(inline_int_null_val(type_info));
+    case kDECIMAL:
+    case kNUMERIC:
       return ll_int(inline_int_null_val(type_info));
     case kARRAY:
       return ll_int(int64_t(0));
@@ -730,13 +736,12 @@ std::pair<int64_t, int32_t> Executor::reduceResults(const SQLAgg agg,
 
 namespace {
 
-template <typename PtrTy>
-PtrTy get_merged_result(
-    std::vector<std::pair<ResultPtr, std::vector<size_t>>>& results_per_device) {
-  auto& first = boost::get<PtrTy>(results_per_device.front().first);
+ResultSetPtr get_merged_result(
+    std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device) {
+  auto& first = results_per_device.front().first;
   CHECK(first);
   for (size_t dev_idx = 1; dev_idx < results_per_device.size(); ++dev_idx) {
-    const auto& next = boost::get<PtrTy>(results_per_device[dev_idx].first);
+    const auto& next = results_per_device[dev_idx].first;
     CHECK(next);
     first->append(*next);
   }
@@ -745,7 +750,7 @@ PtrTy get_merged_result(
 
 }  // namespace
 
-ResultPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
+ResultSetPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
   auto& results_per_device = execution_dispatch.getFragmentResults();
   if (results_per_device.empty()) {
     const auto& ra_exe_unit = execution_dispatch.getExecutionUnit();
@@ -756,7 +761,7 @@ ResultPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
     return std::make_shared<ResultSet>(
         targets, ExecutorDeviceType::CPU, QueryMemoryDescriptor(), nullptr, nullptr);
   }
-  typedef std::pair<ResultPtr, std::vector<size_t>> IndexedResultRows;
+  typedef std::pair<ResultSetPtr, std::vector<size_t>> IndexedResultRows;
   std::sort(results_per_device.begin(),
             results_per_device.end(),
             [](const IndexedResultRows& lhs, const IndexedResultRows& rhs) {
@@ -765,46 +770,12 @@ ResultPtr Executor::resultsUnion(ExecutionDispatch& execution_dispatch) {
               return lhs.second < rhs.second;
             });
 
-  if (boost::get<RowSetPtr>(&results_per_device.front().first)) {
-    return get_merged_result<RowSetPtr>(results_per_device);
-  } else if (boost::get<IterTabPtr>(&results_per_device.front().first)) {
-    return get_merged_result<IterTabPtr>(results_per_device);
-  }
-  CHECK(false);
-  return RowSetPtr(nullptr);
+  return get_merged_result(results_per_device);
 }
 
-namespace {
-
-RowSetPtr reduce_estimator_results(
+ResultSetPtr Executor::reduceMultiDeviceResults(
     const RelAlgExecutionUnit& ra_exe_unit,
-    std::vector<std::pair<ResultPtr, std::vector<size_t>>>& results_per_device) {
-  if (results_per_device.empty()) {
-    return nullptr;
-  }
-  auto first = boost::get<RowSetPtr>(&results_per_device.front().first);
-  CHECK(first && *first);
-  const auto& result_set = *first;
-  CHECK(result_set);
-  auto estimator_buffer = result_set->getHostEstimatorBuffer();
-  CHECK(estimator_buffer);
-  for (size_t i = 1; i < results_per_device.size(); ++i) {
-    auto next = boost::get<RowSetPtr>(&results_per_device[i].first);
-    CHECK(next && *next);
-    const auto& next_result_set = *next;
-    const auto other_estimator_buffer = next_result_set->getHostEstimatorBuffer();
-    for (size_t off = 0; off < ra_exe_unit.estimator->getEstimatorBufferSize(); ++off) {
-      estimator_buffer[off] |= other_estimator_buffer[off];
-    }
-  }
-  return std::move(*first);
-}
-
-}  // namespace
-
-RowSetPtr Executor::reduceMultiDeviceResults(
-    const RelAlgExecutionUnit& ra_exe_unit,
-    std::vector<std::pair<ResultPtr, std::vector<size_t>>>& results_per_device,
+    std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
   if (ra_exe_unit.estimator) {
@@ -826,23 +797,23 @@ RowSetPtr Executor::reduceMultiDeviceResults(
       ResultSet::fixupQueryMemoryDescriptor(query_mem_desc));
 }
 
-RowSetPtr Executor::reduceMultiDeviceResultSets(
-    std::vector<std::pair<ResultPtr, std::vector<size_t>>>& results_per_device,
+ResultSetPtr Executor::reduceMultiDeviceResultSets(
+    std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
   std::shared_ptr<ResultSet> reduced_results;
 
-  const auto& first = boost::get<RowSetPtr>(results_per_device.front().first);
-  CHECK(first);
+  const auto& first = results_per_device.front().first;
 
-  if (query_mem_desc.getGroupByColRangeType() == GroupByColRangeType::MultiCol &&
+  if (query_mem_desc.getQueryDescriptionType() ==
+          QueryDescriptionType::GroupByBaselineHash &&
       results_per_device.size() > 1) {
     const auto total_entry_count = std::accumulate(
         results_per_device.begin(),
         results_per_device.end(),
         size_t(0),
-        [](const size_t init, const std::pair<ResultPtr, std::vector<size_t>>& rs) {
-          const auto& r = boost::get<RowSetPtr>(rs.first);
+        [](const size_t init, const std::pair<ResultSetPtr, std::vector<size_t>>& rs) {
+          const auto& r = rs.first;
           return init + r->getQueryMemDesc().getEntryCount();
         });
     CHECK(total_entry_count);
@@ -872,33 +843,31 @@ RowSetPtr Executor::reduceMultiDeviceResultSets(
   }
 
   for (size_t i = 1; i < results_per_device.size(); ++i) {
-    const auto& result = boost::get<RowSetPtr>(results_per_device[i].first);
-    reduced_results->getStorage()->reduce(*(result->getStorage()));
+    reduced_results->getStorage()->reduce(*(results_per_device[i].first->getStorage()),
+                                          {});
   }
 
   return reduced_results;
 }
 
-RowSetPtr Executor::reduceSpeculativeTopN(
+ResultSetPtr Executor::reduceSpeculativeTopN(
     const RelAlgExecutionUnit& ra_exe_unit,
-    std::vector<std::pair<ResultPtr, std::vector<size_t>>>& results_per_device,
+    std::vector<std::pair<ResultSetPtr, std::vector<size_t>>>& results_per_device,
     std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
     const QueryMemoryDescriptor& query_mem_desc) const {
   if (results_per_device.size() == 1) {
-    auto rows = boost::get<RowSetPtr>(&results_per_device.front().first);
-    CHECK(rows);
-    return std::move(*rows);
+    return std::move(results_per_device.front().first);
   }
   const auto top_n = ra_exe_unit.sort_info.limit + ra_exe_unit.sort_info.offset;
   SpeculativeTopNMap m;
   for (const auto& result : results_per_device) {
-    auto rows = boost::get<RowSetPtr>(&result.first);
+    auto rows = result.first;
     CHECK(rows);
-    if (!*rows) {
+    if (!rows) {
       continue;
     }
     SpeculativeTopNMap that(
-        **rows,
+        *rows,
         ra_exe_unit.target_exprs,
         std::max(size_t(10000 * std::max(1, static_cast<int>(log(top_n)))), top_n));
     m.reduce(that);
@@ -1000,17 +969,18 @@ bool is_trivial_loop_join(const std::vector<InputTableInfo>& query_infos,
          g_trivial_loop_join_threshold;
 }
 
-ResultPtr Executor::executeWorkUnit(int32_t* error_code,
-                                    size_t& max_groups_buffer_entry_guess,
-                                    const bool is_agg,
-                                    const std::vector<InputTableInfo>& query_infos,
-                                    const RelAlgExecutionUnit& ra_exe_unit_in,
-                                    const CompilationOptions& co,
-                                    const ExecutionOptions& options,
-                                    const Catalog_Namespace::Catalog& cat,
-                                    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
-                                    RenderInfo* render_info,
-                                    const bool has_cardinality_estimation) {
+ResultSetPtr Executor::executeWorkUnit(
+    int32_t* error_code,
+    size_t& max_groups_buffer_entry_guess,
+    const bool is_agg,
+    const std::vector<InputTableInfo>& query_infos,
+    const RelAlgExecutionUnit& ra_exe_unit_in,
+    const CompilationOptions& co,
+    const ExecutionOptions& options,
+    const Catalog_Namespace::Catalog& cat,
+    std::shared_ptr<RowSetMemoryOwner> row_set_mem_owner,
+    RenderInfo* render_info,
+    const bool has_cardinality_estimation) {
   INJECT_TIMER(Exec_executeWorkUnit);
   const auto ra_exe_unit = addDeletedColumn(ra_exe_unit_in);
   const auto device_type = getDeviceTypeForTargets(ra_exe_unit, co.device_type_);
@@ -1026,26 +996,8 @@ ResultPtr Executor::executeWorkUnit(int32_t* error_code,
   ColumnCacheMap column_cache;
   auto join_info = JoinInfo(
       JoinImplType::Invalid, std::vector<std::shared_ptr<Analyzer::BinOper>>{}, {}, "");
-  if (ra_exe_unit.input_descs.size() > 1 && ra_exe_unit.inner_joins.empty()) {
-    OOM_TRACE_PUSH();
-    join_info = chooseJoinType(ra_exe_unit.inner_join_quals,
-                               query_infos,
-                               ra_exe_unit,
-                               device_type,
-                               column_cache);
-  }
-  if (join_info.join_impl_type_ == JoinImplType::Loop &&
-      !ra_exe_unit.outer_join_quals.empty()) {
-    OOM_TRACE_PUSH();
-    join_info = chooseJoinType(ra_exe_unit.outer_join_quals,
-                               query_infos,
-                               ra_exe_unit,
-                               device_type,
-                               column_cache);
-  }
 
-  if ((join_info.join_impl_type_ == JoinImplType::Loop ||
-       join_info.join_impl_type_ == JoinImplType::HashPlusLoop) &&
+  if (join_info.join_impl_type_ == JoinImplType::Loop &&
       !(options.allow_loop_joins || is_trivial_loop_join(query_infos, ra_exe_unit))) {
     throw std::runtime_error("Hash join failed, reason: " +
                              join_info.hash_join_fail_reason_);
@@ -1169,7 +1121,7 @@ ResultPtr Executor::executeWorkUnit(int32_t* error_code,
                                      this);
 }
 
-RowSetPtr Executor::executeExplain(const ExecutionDispatch& execution_dispatch) {
+ResultSetPtr Executor::executeExplain(const ExecutionDispatch& execution_dispatch) {
   std::string explained_plan;
   const auto llvm_ir_cpu = execution_dispatch.getIR(ExecutorDeviceType::CPU);
   if (!llvm_ir_cpu.empty()) {
@@ -1261,7 +1213,11 @@ void fill_entries_for_empty_input(std::vector<TargetInfo>& target_infos,
       entry.push_back(inline_null_val(agg_info.agg_arg_type, float_argument_input));
       entry.push_back(0);
     } else if (agg_info.agg_kind == kSAMPLE) {
-      if (agg_info.sql_type.is_varlen()) {
+      if (agg_info.sql_type.is_geometry()) {
+        for (int i = 0; i < agg_info.sql_type.get_physical_coord_cols() * 2; i++) {
+          entry.push_back(0);
+        }
+      } else if (agg_info.sql_type.is_varlen()) {
         entry.push_back(0);
         entry.push_back(0);
       } else {
@@ -1273,9 +1229,10 @@ void fill_entries_for_empty_input(std::vector<TargetInfo>& target_infos,
   }
 }
 
-RowSetPtr build_row_for_empty_input(const std::vector<Analyzer::Expr*>& target_exprs_in,
-                                    const QueryMemoryDescriptor& query_mem_desc,
-                                    const ExecutorDeviceType device_type) {
+ResultSetPtr build_row_for_empty_input(
+    const std::vector<Analyzer::Expr*>& target_exprs_in,
+    const QueryMemoryDescriptor& query_mem_desc,
+    const ExecutorDeviceType device_type) {
   std::vector<std::shared_ptr<Analyzer::Expr>> target_exprs_owned_copies;
   std::vector<Analyzer::Expr*> target_exprs;
   for (const auto target_expr : target_exprs_in) {
@@ -1309,7 +1266,7 @@ RowSetPtr build_row_for_empty_input(const std::vector<Analyzer::Expr*>& target_e
 
 }  // namespace
 
-RowSetPtr Executor::collectAllDeviceResults(
+ResultSetPtr Executor::collectAllDeviceResults(
     ExecutionDispatch& execution_dispatch,
     const std::vector<Analyzer::Expr*>& target_exprs,
     const QueryMemoryDescriptor& query_mem_desc,
@@ -1319,12 +1276,12 @@ RowSetPtr Executor::collectAllDeviceResults(
     if (!query_exe_context || query_exe_context->hasNoFragments()) {
       continue;
     }
-    execution_dispatch.getFragmentResults().emplace_back(
-        query_exe_context->getRowSet(ra_exe_unit, query_mem_desc), std::vector<size_t>{});
+    auto rs = query_exe_context->getRowSet(ra_exe_unit, query_mem_desc);
+    execution_dispatch.getFragmentResults().emplace_back(rs, std::vector<size_t>{});
   }
   auto& result_per_device = execution_dispatch.getFragmentResults();
-  if (result_per_device.empty() &&
-      query_mem_desc.getGroupByColRangeType() == GroupByColRangeType::Scan) {
+  if (result_per_device.empty() && query_mem_desc.getQueryDescriptionType() ==
+                                       QueryDescriptionType::NonGroupedAggregate) {
     return build_row_for_empty_input(
         target_exprs, query_mem_desc, execution_dispatch.getDeviceType());
   }
@@ -1347,11 +1304,11 @@ RowSetPtr Executor::collectAllDeviceResults(
 // Collect top results from each device, stitch them together and sort. Partial
 // results from each device are guaranteed to be disjunct because we only go on
 // this path when one of the columns involved is a shard key.
-RowSetPtr Executor::collectAllDeviceShardedTopResults(
+ResultSetPtr Executor::collectAllDeviceShardedTopResults(
     ExecutionDispatch& execution_dispatch) const {
   const auto& ra_exe_unit = execution_dispatch.getExecutionUnit();
   auto& result_per_device = execution_dispatch.getFragmentResults();
-  const auto first_result_set = boost::get<RowSetPtr>(result_per_device.front().first);
+  const auto first_result_set = result_per_device.front().first;
   CHECK(first_result_set);
   auto top_query_mem_desc = first_result_set->getQueryMemDesc();
   CHECK(!top_query_mem_desc.didOutputColumnar());
@@ -1359,7 +1316,7 @@ RowSetPtr Executor::collectAllDeviceShardedTopResults(
   const auto top_n = ra_exe_unit.sort_info.limit + ra_exe_unit.sort_info.offset;
   top_query_mem_desc.setEntryCount(0);
   for (auto& result : result_per_device) {
-    const auto result_set = boost::get<RowSetPtr>(result.first);
+    const auto result_set = result.first;
     CHECK(result_set);
     result_set->sort(ra_exe_unit.sort_info.order_entries, top_n);
     size_t new_entry_cnt = top_query_mem_desc.getEntryCount() + result_set->rowCount();
@@ -1374,7 +1331,7 @@ RowSetPtr Executor::collectAllDeviceShardedTopResults(
   const auto top_result_set_buffer = top_storage->getUnderlyingBuffer();
   size_t top_output_row_idx{0};
   for (auto& result : result_per_device) {
-    const auto result_set = boost::get<RowSetPtr>(result.first);
+    const auto result_set = result.first;
     CHECK(result_set);
     const auto& top_permutation = result_set->getPermutationBuffer();
     CHECK_LE(top_permutation.size(), top_n);
@@ -1430,8 +1387,9 @@ void Executor::dispatchFragments(
       eo.allow_multifrag &&
       (ra_exe_unit.groupby_exprs.empty() || query_mem_desc.usesCachedContext() ||
 
-       query_mem_desc.getGroupByColRangeType() == GroupByColRangeType::MultiCol ||
-       query_mem_desc.getGroupByColRangeType() == GroupByColRangeType::Projection);
+       query_mem_desc.getQueryDescriptionType() ==
+           QueryDescriptionType::GroupByBaselineHash ||
+       query_mem_desc.getQueryDescriptionType() == QueryDescriptionType::Projection);
   const bool use_multifrag_kernel =
       (device_type == ExecutorDeviceType::GPU) && allow_multifrag && is_agg;
 
@@ -1563,7 +1521,7 @@ bool Executor::skipFragmentPair(
   // Don't bother with sharding for non-hash joins.
   if (plan_state_->join_info_.join_impl_type_ != Executor::JoinImplType::HashOneToOne &&
       plan_state_->join_info_.join_impl_type_ != Executor::JoinImplType::HashOneToMany &&
-      ra_exe_unit.inner_joins.empty()) {
+      ra_exe_unit.join_quals.empty()) {
     return false;
   }
   // Both tables need to be sharded the same way.
@@ -1572,7 +1530,7 @@ bool Executor::skipFragmentPair(
     return false;
   }
   const Analyzer::BinOper* join_condition{nullptr};
-  if (ra_exe_unit.inner_joins.empty()) {
+  if (ra_exe_unit.join_quals.empty()) {
     CHECK(!inner_table_id_to_join_condition.empty());
     auto condition_it = inner_table_id_to_join_condition.find(inner_table_id);
     CHECK(condition_it != inner_table_id_to_join_condition.end());
@@ -1599,39 +1557,19 @@ bool Executor::skipFragmentPair(
   } else {
     shard_count = get_shard_count(join_condition, ra_exe_unit, this);
   }
-  if (shard_count && !ra_exe_unit.inner_joins.empty()) {
+  if (shard_count && !ra_exe_unit.join_quals.empty()) {
     plan_state_->join_info_.sharded_range_table_indices_.emplace(table_idx);
   }
   return shard_count;
-}
-
-std::vector<const int8_t*> Executor::fetchIterTabFrags(
-    const size_t frag_id,
-    const ExecutionDispatch& execution_dispatch,
-    const InputDescriptor& table_desc,
-    const int device_id) {
-  CHECK(table_desc.getSourceType() == InputSourceType::RESULT);
-  const auto& temp = get_temporary_table(temporary_tables_, table_desc.getTableId());
-  const auto table = boost::get<IterTabPtr>(&temp);
-  CHECK(table && *table);
-  std::vector<const int8_t*> frag_iter_buffers;
-  for (size_t i = 0; i < (*table)->colCount(); ++i) {
-    const InputColDescriptor desc(i, table_desc.getTableId(), 0);
-    frag_iter_buffers.push_back(execution_dispatch.getColumn(
-        &desc, frag_id, {}, {}, Data_Namespace::CPU_LEVEL, device_id, false));
-  }
-  return frag_iter_buffers;
 }
 
 namespace {
 
 const ColumnDescriptor* try_get_column_descriptor(const InputColDescriptor* col_desc,
                                                   const Catalog_Namespace::Catalog& cat) {
-  const auto ind_col = dynamic_cast<const IndirectInputColDescriptor*>(col_desc);
-  const int ref_table_id = ind_col ? ind_col->getIndirectDesc().getTableId()
-                                   : col_desc->getScanDesc().getTableId();
-  const int ref_col_id = ind_col ? ind_col->getRefColIndex() : col_desc->getColId();
-  return get_column_descriptor_maybe(ref_col_id, ref_table_id, cat);
+  const int table_id = col_desc->getScanDesc().getTableId();
+  const int col_id = col_desc->getColId();
+  return get_column_descriptor_maybe(col_id, table_id, cat);
 }
 
 }  // namespace
@@ -1659,13 +1597,11 @@ Executor::getRowCountAndOffsetForAllFrags(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CartesianProduct<std::vector<std::vector<size_t>>>& frag_ids_crossjoin,
     const std::vector<InputDescriptor>& input_descs,
-    const std::map<int, const TableFragments*>& all_tables_fragments,
-    const bool one_to_all_frags) {
+    const std::map<int, const TableFragments*>& all_tables_fragments) {
   std::vector<std::vector<int64_t>> all_num_rows;
   std::vector<std::vector<uint64_t>> all_frag_offsets;
   const auto tab_id_to_frag_offsets =
       get_table_id_to_frag_offsets(input_descs, all_tables_fragments);
-  CHECK(!one_to_all_frags || input_descs.size() == 2);
   std::unordered_map<size_t, size_t> outer_id_to_num_row_idx;
   for (const auto& selected_frag_ids : frag_ids_crossjoin) {
     std::vector<int64_t> num_rows;
@@ -1677,7 +1613,7 @@ Executor::getRowCountAndOffsetForAllFrags(
           all_tables_fragments.find(input_descs[tab_idx].getTableId());
       CHECK(fragments_it != all_tables_fragments.end());
       const auto& fragments = *fragments_it->second;
-      if (ra_exe_unit.inner_joins.empty() || tab_idx == 0 ||
+      if (ra_exe_unit.join_quals.empty() || tab_idx == 0 ||
           plan_state_->join_info_.sharded_range_table_indices_.count(tab_idx)) {
         const auto& fragment = fragments[frag_id];
         num_rows.push_back(fragment.getNumTuples());
@@ -1696,15 +1632,6 @@ Executor::getRowCountAndOffsetForAllFrags(
       frag_offsets.push_back(offsets[frag_id]);
     }
     all_num_rows.push_back(num_rows);
-    if (one_to_all_frags) {
-      const auto outer_frag_id = selected_frag_ids[0];
-      if (outer_id_to_num_row_idx.count(outer_frag_id)) {
-        all_num_rows[outer_id_to_num_row_idx[outer_frag_id]][1] += num_rows[1];
-      } else {
-        outer_id_to_num_row_idx.insert(
-            std::make_pair(outer_frag_id, all_num_rows.size() - 1));
-      }
-    }
     // Fragment offsets of outer table should be ONLY used by rowid for now.
     all_frag_offsets.push_back(frag_offsets);
   }
@@ -1720,12 +1647,11 @@ bool Executor::needFetchAllFragments(const InputColDescriptor& inner_col_desc,
   const int nest_level = inner_col_desc.getScanDesc().getNestLevel();
   if (nest_level < 1 ||
       inner_col_desc.getScanDesc().getSourceType() != InputSourceType::TABLE ||
-      (ra_exe_unit.inner_joins.empty() &&
+      (ra_exe_unit.join_quals.empty() &&
        plan_state_->join_info_.join_impl_type_ != JoinImplType::HashOneToOne &&
-       plan_state_->join_info_.join_impl_type_ != JoinImplType::HashOneToMany &&
-       !isOuterLoopJoin()) ||
+       plan_state_->join_info_.join_impl_type_ != JoinImplType::HashOneToMany) ||
       input_descs.size() < 2 ||
-      (ra_exe_unit.inner_joins.empty() &&
+      (ra_exe_unit.join_quals.empty() &&
        plan_state_->isLazyFetchColumn(inner_col_desc))) {
     return false;
   }
@@ -1763,11 +1689,6 @@ Executor::FetchResult Executor::fetchChunks(
   std::vector<std::vector<const int8_t*>> all_frag_iter_buffers;
   std::vector<std::vector<int64_t>> all_num_rows;
   std::vector<std::vector<uint64_t>> all_frag_offsets;
-  const auto extra_tab_id_to_frag_offsets =
-      get_table_id_to_frag_offsets(ra_exe_unit.extra_input_descs, all_tables_fragments);
-  const bool needs_fetch_iterators =
-      ra_exe_unit.join_dimensions.size() > 2 &&
-      dynamic_cast<Analyzer::IterExpr*>(ra_exe_unit.target_exprs.front());
 
   for (const auto& selected_frag_ids : frag_ids_crossjoin) {
     std::vector<const int8_t*> frag_col_buffers(
@@ -1780,9 +1701,7 @@ Executor::FetchResult Executor::fetchChunks(
       if (cd && cd->isVirtualCol) {
         CHECK_EQ("rowid", cd->columnName);
         is_rowid = true;
-        if (!std::dynamic_pointer_cast<const IndirectInputColDescriptor>(col_id)) {
-          continue;
-        }
+        continue;
       }
       const auto fragments_it = all_tables_fragments.find(table_id);
       CHECK(fragments_it != all_tables_fragments.end());
@@ -1807,7 +1726,6 @@ Executor::FetchResult Executor::fetchChunks(
             execution_dispatch.getColumn(col_id.get(),
                                          frag_id,
                                          all_tables_fragments,
-                                         extra_tab_id_to_frag_offsets,
                                          memory_level_for_column,
                                          device_id,
                                          is_rowid);
@@ -1833,28 +1751,16 @@ Executor::FetchResult Executor::fetchChunks(
       }
     }
     all_frag_col_buffers.push_back(frag_col_buffers);
-    // IteratorTable on the left could only have a single fragment for now.
-    if (needs_fetch_iterators && all_frag_iter_buffers.empty()) {
-      CHECK_EQ(size_t(2), selected_fragments_crossjoin.size());
-      all_frag_iter_buffers.push_back(fetchIterTabFrags(selected_frag_ids[0],
-                                                        execution_dispatch,
-                                                        ra_exe_unit.input_descs[0],
-                                                        device_id));
-    }
   }
-  std::tie(all_num_rows, all_frag_offsets) =
-      getRowCountAndOffsetForAllFrags(ra_exe_unit,
-                                      frag_ids_crossjoin,
-                                      ra_exe_unit.input_descs,
-                                      all_tables_fragments,
-                                      isOuterLoopJoin());
+  std::tie(all_num_rows, all_frag_offsets) = getRowCountAndOffsetForAllFrags(
+      ra_exe_unit, frag_ids_crossjoin, ra_exe_unit.input_descs, all_tables_fragments);
   return {all_frag_col_buffers, all_frag_iter_buffers, all_num_rows, all_frag_offsets};
 }
 
 std::vector<size_t> Executor::getFragmentCount(const FragmentsList& selected_fragments,
                                                const size_t scan_idx,
                                                const RelAlgExecutionUnit& ra_exe_unit) {
-  if ((ra_exe_unit.input_descs.size() > size_t(2) || !ra_exe_unit.inner_joins.empty()) &&
+  if ((ra_exe_unit.input_descs.size() > size_t(2) || !ra_exe_unit.join_quals.empty()) &&
       scan_idx > 0 &&
       !plan_state_->join_info_.sharded_range_table_indices_.count(scan_idx) &&
       !selected_fragments[scan_idx].fragment_ids.empty()) {
@@ -1910,14 +1816,109 @@ class OutVecOwner {
  private:
   std::vector<int64_t*> out_vec_;
 };
-
 }  // namespace
+
+template <typename META_TYPE_CLASS>
+class AggregateReductionEgress {
+ public:
+  using ReturnType = void;
+
+  // TODO:  Avoid parameter struct indirection and forward directly
+  ReturnType operator()(int const entry_count,
+                        int& error_code,
+                        TargetInfo const& agg_info,
+                        size_t& out_vec_idx,
+                        std::vector<int64_t*>& out_vec,
+                        std::vector<int64_t>& reduced_outs,
+                        QueryExecutionContext* query_exe_context) {
+    int64_t val1;
+    const bool float_argument_input = takes_float_argument(agg_info);
+    if (is_distinct_target(agg_info)) {
+      CHECK(agg_info.agg_kind == kCOUNT || agg_info.agg_kind == kAPPROX_COUNT_DISTINCT);
+      val1 = out_vec[out_vec_idx][0];
+      error_code = 0;
+    } else {
+      const auto chosen_bytes = static_cast<size_t>(
+          query_exe_context->query_mem_desc_.getColumnWidth(out_vec_idx).compact);
+      std::tie(val1, error_code) =
+          Executor::reduceResults(agg_info.agg_kind,
+                                  agg_info.sql_type,
+                                  query_exe_context->init_agg_vals_[out_vec_idx],
+                                  float_argument_input ? sizeof(int32_t) : chosen_bytes,
+                                  out_vec[out_vec_idx],
+                                  entry_count,
+                                  false,
+                                  float_argument_input);
+    }
+    if (error_code) {
+      return;
+    }
+    reduced_outs.push_back(val1);
+    if (agg_info.agg_kind == kAVG ||
+        (agg_info.agg_kind == kSAMPLE &&
+         (agg_info.sql_type.is_varlen() || agg_info.sql_type.is_geometry()))) {
+      const auto chosen_bytes = static_cast<size_t>(
+          query_exe_context->query_mem_desc_.getColumnWidth(out_vec_idx + 1).compact);
+      int64_t val2;
+      std::tie(val2, error_code) =
+          Executor::reduceResults(agg_info.agg_kind == kAVG ? kCOUNT : agg_info.agg_kind,
+                                  agg_info.sql_type,
+                                  query_exe_context->init_agg_vals_[out_vec_idx + 1],
+                                  float_argument_input ? sizeof(int32_t) : chosen_bytes,
+                                  out_vec[out_vec_idx + 1],
+                                  entry_count,
+                                  false,
+                                  false);
+      if (error_code) {
+        return;
+      }
+      reduced_outs.push_back(val2);
+      ++out_vec_idx;
+    }
+    ++out_vec_idx;
+  }
+};
+
+// Handles reduction for geo-types
+template <>
+class AggregateReductionEgress<Experimental::MetaTypeClass<Experimental::Geometry>> {
+ public:
+  using ReturnType = void;
+
+  ReturnType operator()(int const entry_count,
+                        int& error_code,
+                        TargetInfo const& agg_info,
+                        size_t& out_vec_idx,
+                        std::vector<int64_t*>& out_vec,
+                        std::vector<int64_t>& reduced_outs,
+                        QueryExecutionContext* query_exe_context) {
+    for (int i = 0; i < agg_info.sql_type.get_physical_coord_cols() * 2; i++) {
+      int64_t val1;
+      const auto chosen_bytes = static_cast<size_t>(
+          query_exe_context->query_mem_desc_.getColumnWidth(out_vec_idx).compact);
+      std::tie(val1, error_code) =
+          Executor::reduceResults(agg_info.agg_kind,
+                                  agg_info.sql_type,
+                                  query_exe_context->init_agg_vals_[out_vec_idx],
+                                  chosen_bytes,
+                                  out_vec[out_vec_idx],
+                                  entry_count,
+                                  false,
+                                  false);
+      if (error_code) {
+        return;
+      }
+      reduced_outs.push_back(val1);
+      out_vec_idx++;
+    }
+  }
+};
 
 int32_t Executor::executePlanWithoutGroupBy(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CompilationResult& compilation_result,
     const bool hoist_literals,
-    ResultPtr& results,
+    ResultSetPtr& results,
     const std::vector<Analyzer::Expr*>& target_exprs,
     const ExecutorDeviceType device_type,
     std::vector<std::vector<const int8_t*>>& col_buffers,
@@ -1931,7 +1932,7 @@ int32_t Executor::executePlanWithoutGroupBy(
     const uint32_t num_tables,
     RenderInfo* render_info) {
   INJECT_TIMER(executePlanWithoutGroupBy);
-  results = RowSetPtr(nullptr);
+  CHECK(!results);
   if (col_buffers.empty()) {
     return 0;
   }
@@ -2023,53 +2024,26 @@ int32_t Executor::executePlanWithoutGroupBy(
     }
   } else {
     size_t out_vec_idx = 0;
+
     for (const auto target_expr : target_exprs) {
       const auto agg_info = target_info(target_expr);
       CHECK(agg_info.is_agg);
-      int64_t val1;
-      const bool float_argument_input = takes_float_argument(agg_info);
-      if (is_distinct_target(agg_info)) {
-        CHECK(agg_info.agg_kind == kCOUNT || agg_info.agg_kind == kAPPROX_COUNT_DISTINCT);
-        val1 = out_vec[out_vec_idx][0];
-        error_code = 0;
-      } else {
-        const auto chosen_bytes = static_cast<size_t>(
-            query_exe_context->query_mem_desc_.getColumnWidth(out_vec_idx).compact);
-        std::tie(val1, error_code) =
-            reduceResults(agg_info.agg_kind,
-                          agg_info.sql_type,
-                          query_exe_context->init_agg_vals_[out_vec_idx],
-                          float_argument_input ? sizeof(int32_t) : chosen_bytes,
-                          out_vec[out_vec_idx],
-                          entry_count,
-                          false,
-                          float_argument_input);
-      }
+
+      auto meta_class(
+          Experimental::GeoMetaTypeClassFactory::getMetaTypeClass(agg_info.sql_type));
+      auto agg_reduction_impl =
+          Experimental::GeoVsNonGeoClassHandler<AggregateReductionEgress>();
+      agg_reduction_impl(meta_class,
+                         entry_count,
+                         error_code,
+                         agg_info,
+                         out_vec_idx,
+                         out_vec,
+                         reduced_outs,
+                         query_exe_context);
       if (error_code) {
         break;
       }
-      reduced_outs.push_back(val1);
-      if (agg_info.agg_kind == kAVG ||
-          (agg_info.agg_kind == kSAMPLE && agg_info.sql_type.is_varlen())) {
-        const auto chosen_bytes = static_cast<size_t>(
-            query_exe_context->query_mem_desc_.getColumnWidth(out_vec_idx + 1).compact);
-        int64_t val2;
-        std::tie(val2, error_code) =
-            reduceResults(agg_info.agg_kind == kAVG ? kCOUNT : agg_info.agg_kind,
-                          agg_info.sql_type,
-                          query_exe_context->init_agg_vals_[out_vec_idx + 1],
-                          float_argument_input ? sizeof(int32_t) : chosen_bytes,
-                          out_vec[out_vec_idx + 1],
-                          entry_count,
-                          false,
-                          false);
-        if (error_code) {
-          break;
-        }
-        reduced_outs.push_back(val2);
-        ++out_vec_idx;
-      }
-      ++out_vec_idx;
     }
   }
 
@@ -2083,14 +2057,9 @@ int32_t Executor::executePlanWithoutGroupBy(
 
 namespace {
 
-bool check_rows_less_than_needed(const ResultPtr& results, const size_t scan_limit) {
+bool check_rows_less_than_needed(const ResultSetPtr& results, const size_t scan_limit) {
   CHECK(scan_limit);
-  if (const auto rows = boost::get<RowSetPtr>(&results)) {
-    return (*rows && (*rows)->rowCount() < scan_limit);
-  } else if (const auto tab = boost::get<IterTabPtr>(&results)) {
-    return (*tab && (*tab)->rowCount() < scan_limit);
-  }
-  abort();
+  return results && results->rowCount() < scan_limit;
 }
 
 }  // namespace
@@ -2099,7 +2068,7 @@ int32_t Executor::executePlanWithGroupBy(
     const RelAlgExecutionUnit& ra_exe_unit,
     const CompilationResult& compilation_result,
     const bool hoist_literals,
-    ResultPtr& results,
+    ResultSetPtr& results,
     const ExecutorDeviceType device_type,
     std::vector<std::vector<const int8_t*>>& col_buffers,
     const std::vector<size_t> outer_tab_frag_ids,
@@ -2114,11 +2083,7 @@ int32_t Executor::executePlanWithGroupBy(
     const uint32_t num_tables,
     RenderInfo* render_info) {
   INJECT_TIMER(executePlanWithGroupBy);
-  if (contains_iter_expr(ra_exe_unit.target_exprs)) {
-    results = IterTabPtr(nullptr);
-  } else {
-    results = RowSetPtr(nullptr);
-  }
+  CHECK(!results);
   if (col_buffers.empty()) {
     return 0;
   }
@@ -2198,10 +2163,10 @@ int32_t Executor::executePlanWithGroupBy(
       !query_exe_context->query_mem_desc_.usesCachedContext() &&
       !render_allocator_map_ptr) {
     CHECK(!query_exe_context->query_mem_desc_.sortOnGpu());
-    results = query_exe_context->getResult(ra_exe_unit, outer_tab_frag_ids);
-    if (auto rows = boost::get<RowSetPtr>(&results)) {
-      (*rows)->holdLiterals(hoist_buf);
-    }
+    results =
+        query_exe_context->getRowSet(ra_exe_unit, query_exe_context->query_mem_desc_);
+    CHECK(results);
+    results->holdLiterals(hoist_buf);
   }
   if (error_code && (render_allocator_map_ptr ||
                      (!scan_limit || check_rows_less_than_needed(results, scan_limit)))) {
@@ -2332,7 +2297,9 @@ void Executor::executeSimpleInsert(const Planner::RootPlan* root_plan) {
     } else {
       const auto it_ok = col_buffers.emplace(
           col_id,
-          std::unique_ptr<uint8_t[]>(new uint8_t[cd->columnType.get_logical_size()]));
+          std::unique_ptr<uint8_t[]>(
+              new uint8_t[cd->columnType.get_logical_size()]()));  // changed to zero-init
+                                                                   // the buffer
       CHECK(it_ok.second);
     }
     col_descriptors.push_back(cd);
@@ -2354,8 +2321,7 @@ void Executor::executeSimpleInsert(const Planner::RootPlan* root_plan) {
     CHECK(col_cv);
     const auto cd = col_descriptors[col_idx];
     auto col_datum = col_cv->get_constval();
-    auto col_type = cd->columnType.is_decimal() ? decimal_to_int_type(cd->columnType)
-                                                : cd->columnType.get_type();
+    auto col_type = cd->columnType.get_type();
     uint8_t* col_data_bytes{nullptr};
     if (!cd->columnType.is_array() && !cd->columnType.is_geometry() &&
         (!cd->columnType.is_string() ||
@@ -2392,7 +2358,9 @@ void Executor::executeSimpleInsert(const Planner::RootPlan* root_plan) {
         int_col_val = col_datum.intval;
         break;
       }
-      case kBIGINT: {
+      case kBIGINT:
+      case kDECIMAL:
+      case kNUMERIC: {
         auto col_data = reinterpret_cast<int64_t*>(col_data_bytes);
         *col_data = col_cv->get_is_null() ? inline_fixed_encoding_null_val(cd->columnType)
                                           : col_datum.bigintval;
@@ -2452,9 +2420,6 @@ void Executor::executeSimpleInsert(const Planner::RootPlan* root_plan) {
       case kARRAY: {
         const auto l = col_cv->get_value_list();
         SQLTypeInfo elem_ti = cd->columnType.get_elem_type();
-        if (elem_ti.is_string()) {
-          throw std::runtime_error("INSERT INTO text arrays is not yet supported.");
-        }
         size_t len = l.size() * elem_ti.get_size();
         auto size = cd->columnType.get_size();
         if (size > 0 && static_cast<size_t>(size) != len) {
@@ -2541,16 +2506,14 @@ void Executor::nukeOldState(const bool allow_lazy_fetch,
                             const std::vector<InputTableInfo>& query_infos,
                             const RelAlgExecutionUnit& ra_exe_unit) {
   const bool contains_left_deep_outer_join =
-      std::find_if(ra_exe_unit.inner_joins.begin(),
-                   ra_exe_unit.inner_joins.end(),
+      std::find_if(ra_exe_unit.join_quals.begin(),
+                   ra_exe_unit.join_quals.end(),
                    [](const JoinCondition& join_condition) {
                      return join_condition.type == JoinType::LEFT;
-                   }) != ra_exe_unit.inner_joins.end();
-  const bool has_outer_joins =
-      !ra_exe_unit.outer_join_quals.empty() || contains_left_deep_outer_join;
-  cgen_state_.reset(new CgenState(
-      query_infos, !ra_exe_unit.outer_join_quals.empty(), contains_left_deep_outer_join));
-  plan_state_.reset(new PlanState(allow_lazy_fetch && !has_outer_joins, join_info, this));
+                   }) != ra_exe_unit.join_quals.end();
+  cgen_state_.reset(new CgenState(query_infos, contains_left_deep_outer_join));
+  plan_state_.reset(
+      new PlanState(allow_lazy_fetch && !contains_left_deep_outer_join, join_info, this));
 }
 
 void Executor::preloadFragOffsets(const std::vector<InputDescriptor>& input_descs,
@@ -2572,156 +2535,6 @@ void Executor::preloadFragOffsets(const std::vector<InputDescriptor>& input_desc
     }
   }
 }
-
-void Executor::codegenNomatchInitialization(const int index) {
-  CHECK(isOuterJoin());
-  cgen_state_->outer_join_match_found_ =
-      cgen_state_->ir_builder_.CreateAlloca(get_int_type(1, cgen_state_->context_),
-                                            nullptr,
-                                            "match_found_" + std::to_string(index));
-  cgen_state_->outer_join_nomatch_ = cgen_state_->ir_builder_.CreateAlloca(
-      get_int_type(1, cgen_state_->context_),
-      nullptr,
-      "outer_join_nomatch_flag" + std::to_string(index));
-  cgen_state_->ir_builder_.CreateStore(ll_bool(false),
-                                       cgen_state_->outer_join_match_found_);
-  cgen_state_->ir_builder_.CreateStore(ll_bool(false), cgen_state_->outer_join_nomatch_);
-}
-
-void Executor::codegenNomatchLoopback(const std::function<void()> init_iters,
-                                      llvm::BasicBlock* loop_head) {
-  CHECK(isOuterJoin());
-  auto nomatch_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "outer_join_nomatch", cgen_state_->row_func_);
-  auto ret_bb = llvm::BasicBlock::Create(
-      cgen_state_->context_, "inner_scan_ret", cgen_state_->row_func_);
-  auto match_found_lv =
-      cgen_state_->ir_builder_.CreateLoad(cgen_state_->outer_join_match_found_);
-  cgen_state_->ir_builder_.CreateCondBr(match_found_lv, ret_bb, nomatch_bb);
-  cgen_state_->ir_builder_.SetInsertPoint(nomatch_bb);
-  init_iters();
-  cgen_state_->ir_builder_.CreateStore(ll_bool(true), cgen_state_->outer_join_nomatch_);
-  cgen_state_->ir_builder_.CreateBr(loop_head);
-  cgen_state_->ir_builder_.SetInsertPoint(ret_bb);
-}
-
-void Executor::allocateInnerScansIterators(
-    const std::vector<InputDescriptor>& input_descs) {
-  if (input_descs.size() <= 1) {
-    return;
-  }
-  if (plan_state_->join_info_.join_impl_type_ == JoinImplType::HashOneToOne ||
-      plan_state_->join_info_.join_impl_type_ == JoinImplType::HashOneToMany) {
-    return;
-  }
-  size_t desc_start_pos = 1;
-  if (plan_state_->join_info_.join_impl_type_ == JoinImplType::HashPlusLoop) {
-    desc_start_pos = input_descs.size() - 1;
-  } else {
-    CHECK(plan_state_->join_info_.join_impl_type_ == JoinImplType::Loop);
-  }
-  auto preheader = cgen_state_->ir_builder_.GetInsertBlock();
-  for (auto it = input_descs.begin() + desc_start_pos; it != input_descs.end(); ++it) {
-    const int inner_scan_idx = it - input_descs.begin();
-    auto inner_scan_pos_ptr = cgen_state_->ir_builder_.CreateAlloca(
-        get_int_type(64, cgen_state_->context_),
-        nullptr,
-        "inner_scan_" + std::to_string(inner_scan_idx));
-    cgen_state_->ir_builder_.CreateStore(ll_int(int64_t(0)), inner_scan_pos_ptr);
-    llvm::Value* rows_per_scan_ptr = nullptr;
-    llvm::Value* rows_per_scan = nullptr;
-    if (isOuterJoin()) {
-      CHECK_EQ(input_descs.size(), size_t(2));
-      rows_per_scan_ptr = cgen_state_->ir_builder_.CreateGEP(
-          get_arg_by_name(cgen_state_->row_func_, "num_rows_per_scan"),
-          ll_int(int32_t(inner_scan_idx)));
-      rows_per_scan =
-          cgen_state_->ir_builder_.CreateLoad(rows_per_scan_ptr, "num_rows_per_scan");
-      rows_per_scan_ptr = cgen_state_->ir_builder_.CreateAlloca(
-          get_int_type(64, cgen_state_->context_), nullptr, "num_rows_per_scan_copy");
-      cgen_state_->ir_builder_.CreateStore(rows_per_scan, rows_per_scan_ptr);
-      codegenNomatchInitialization(inner_scan_idx);
-    }
-    auto scan_loop_head = llvm::BasicBlock::Create(cgen_state_->context_,
-                                                   "scan_loop_head",
-                                                   cgen_state_->row_func_,
-                                                   preheader->getNextNode());
-    cgen_state_->inner_scan_labels_.push_back(scan_loop_head);
-    cgen_state_->ir_builder_.CreateBr(scan_loop_head);
-    cgen_state_->ir_builder_.SetInsertPoint(scan_loop_head);
-    if (isOuterJoin()) {
-      rows_per_scan =
-          cgen_state_->ir_builder_.CreateLoad(rows_per_scan_ptr, "rows_per_scan");
-    }
-    auto inner_scan_pos =
-        cgen_state_->ir_builder_.CreateLoad(inner_scan_pos_ptr, "load_inner_it");
-    {
-      const auto it_ok = cgen_state_->scan_to_iterator_.insert(
-          std::make_pair(*it, std::make_pair(inner_scan_pos, inner_scan_pos_ptr)));
-      CHECK(it_ok.second);
-    }
-    if (!isOuterJoin()) {
-      CHECK(!rows_per_scan_ptr);
-      rows_per_scan_ptr = cgen_state_->ir_builder_.CreateGEP(
-          get_arg_by_name(cgen_state_->row_func_, "num_rows_per_scan"),
-          ll_int(int32_t(inner_scan_idx)));
-      CHECK(!rows_per_scan);
-      rows_per_scan =
-          cgen_state_->ir_builder_.CreateLoad(rows_per_scan_ptr, "num_rows_per_scan");
-    }
-    auto have_more_inner_rows = cgen_state_->ir_builder_.CreateICmp(
-        llvm::ICmpInst::ICMP_ULT, inner_scan_pos, rows_per_scan);
-    auto inner_scan_ret =
-        llvm::BasicBlock::Create(cgen_state_->context_,
-                                 (isOuterJoin() ? "inner_scan_ret" : "check_match_found"),
-                                 cgen_state_->row_func_);
-    auto inner_scan_cont = llvm::BasicBlock::Create(
-        cgen_state_->context_, "inner_scan_cont", cgen_state_->row_func_);
-    cgen_state_->ir_builder_.CreateCondBr(
-        have_more_inner_rows, inner_scan_cont, inner_scan_ret);
-    cgen_state_->ir_builder_.SetInsertPoint(inner_scan_ret);
-    if (isOuterJoin()) {
-      auto init_iters = [this, &rows_per_scan_ptr, &inner_scan_pos_ptr]() {
-        cgen_state_->ir_builder_.CreateStore(ll_int(int64_t(1)), rows_per_scan_ptr);
-        cgen_state_->ir_builder_.CreateStore(ll_int(int64_t(0)), inner_scan_pos_ptr);
-      };
-      codegenNomatchLoopback(init_iters, scan_loop_head);
-    }
-    cgen_state_->ir_builder_.CreateRet(ll_int(int32_t(0)));
-    cgen_state_->ir_builder_.SetInsertPoint(inner_scan_cont);
-  }
-}
-
-namespace {
-
-void check_loop_join_replication_constraint(const Catalog_Namespace::Catalog* catalog,
-                                            const RelAlgExecutionUnit& ra_exe_unit) {
-  if (!g_cluster) {
-    return;
-  }
-  CHECK(!ra_exe_unit.input_descs.empty());
-  const auto inner_table_id = ra_exe_unit.input_descs.back().getTableId();
-  if (inner_table_id >= 0) {
-    const auto inner_td = catalog->getMetadataForTable(inner_table_id);
-    CHECK(inner_td);
-    if (!table_is_replicated(inner_td)) {
-      throw std::runtime_error("Join table " + inner_td->tableName +
-                               " must be replicated");
-    }
-  }
-}
-
-bool has_one_to_many_hash_table(
-    const std::vector<std::shared_ptr<JoinHashTableInterface>>& hash_tables) {
-  for (auto ht : hash_tables) {
-    if (ht->getHashType() == JoinHashTableInterface::HashType::OneToMany) {
-      return true;
-    }
-  }
-  return false;
-}
-
-}  // namespace
 
 Executor::JoinHashTableOrError Executor::buildHashTableForQualifier(
     const std::shared_ptr<Analyzer::BinOper>& qual_bin_oper,
@@ -2781,95 +2594,6 @@ Executor::JoinHashTableOrError Executor::buildHashTableForQualifier(
   }
   CHECK(false);
   return {nullptr, ""};
-}
-
-Executor::JoinInfo Executor::chooseJoinType(
-    const std::list<std::shared_ptr<Analyzer::Expr>>& join_quals,
-    const std::vector<InputTableInfo>& query_infos,
-    const RelAlgExecutionUnit& ra_exe_unit,
-    const ExecutorDeviceType device_type,
-    ColumnCacheMap& column_cache) {
-  std::string hash_join_fail_reason{"No equijoin expression found"};
-
-  const MemoryLevel memory_level{device_type == ExecutorDeviceType::GPU
-                                     ? MemoryLevel::GPU_LEVEL
-                                     : MemoryLevel::CPU_LEVEL};
-
-  std::set<int> rte_idx_set;
-  std::unordered_set<int> visited_tables;
-  std::vector<std::shared_ptr<Analyzer::BinOper>> bin_ops;
-  std::vector<std::shared_ptr<JoinHashTableInterface>> join_hash_tables;
-  for (auto qual : join_quals) {
-    auto qual_bin_oper = std::dynamic_pointer_cast<Analyzer::BinOper>(qual);
-    if (!qual_bin_oper) {
-      const auto bool_const = std::dynamic_pointer_cast<Analyzer::Constant>(qual);
-      if (bool_const) {
-        CHECK(bool_const->get_type_info().is_boolean());
-      }
-      continue;
-    }
-    if (IS_EQUIVALENCE(qual_bin_oper->get_optype())) {
-      const auto hash_table_and_error = buildHashTableForQualifier(qual_bin_oper,
-                                                                   query_infos,
-                                                                   ra_exe_unit,
-                                                                   memory_level,
-                                                                   visited_tables,
-                                                                   column_cache);
-      if (hash_table_and_error.hash_table) {
-        std::set<int> curr_rte_idx_set;
-        qual_bin_oper->collect_rte_idx(curr_rte_idx_set);
-        CHECK_EQ(curr_rte_idx_set.size(), size_t(2));
-        rte_idx_set.insert(curr_rte_idx_set.begin(), curr_rte_idx_set.end());
-        visited_tables.insert(hash_table_and_error.hash_table->getInnerTableId());
-        bin_ops.push_back(qual_bin_oper);
-        join_hash_tables.push_back(hash_table_and_error.hash_table);
-      } else {
-        hash_join_fail_reason = hash_table_and_error.fail_reason;
-      }
-    }
-  }
-
-  bool found_missing_rte = false;
-  ssize_t missing_rte = -1;
-  const auto nest_level_num = ra_exe_unit.input_descs.size();
-  for (size_t i = 0; i < nest_level_num; ++i) {
-    if (!rte_idx_set.count(i)) {
-      missing_rte = i;
-      found_missing_rte = true;
-      break;
-    }
-  }
-  if (join_hash_tables.size() < nest_level_num - 1) {
-    check_loop_join_replication_constraint(catalog_, ra_exe_unit);
-  }
-  if (found_missing_rte) {
-    // TODO(miyu): support a loop join in the beginning or middle of hash joins.
-    if (missing_rte == static_cast<ssize_t>(nest_level_num - 1) &&
-        join_hash_tables.size() == nest_level_num - 2) {
-      if (!has_one_to_many_hash_table(join_hash_tables)) {
-        return Executor::JoinInfo(
-            JoinImplType::HashPlusLoop, bin_ops, join_hash_tables, hash_join_fail_reason);
-      }
-    }
-  } else {
-    if (join_hash_tables.size() == nest_level_num - 1) {
-      // TODO(miyu): support one-to-many hash join in folded join sequence.
-      if (has_one_to_many_hash_table(join_hash_tables)) {
-        if (nest_level_num == 2) {
-          return Executor::JoinInfo(
-              JoinImplType::HashOneToMany, bin_ops, join_hash_tables, "");
-        }
-      } else {
-        return Executor::JoinInfo(
-            JoinImplType::HashOneToOne, bin_ops, join_hash_tables, "");
-      }
-    }
-  }
-
-  return Executor::JoinInfo(JoinImplType::Loop,
-                            std::vector<std::shared_ptr<Analyzer::BinOper>>{},
-                            {},
-                            hash_join_fail_reason);
 }
 
 int8_t Executor::warpSize() const {
@@ -3043,10 +2767,6 @@ std::pair<bool, int64_t> Executor::skipFragment(
     const std::vector<uint64_t>& frag_offsets,
     const size_t frag_idx) {
   const int table_id = table_desc.getTableId();
-  if (table_desc.getSourceType() == InputSourceType::RESULT &&
-      boost::get<IterTabPtr>(&get_temporary_table(temporary_tables_, table_id))) {
-    return {false, -1};
-  }
   for (const auto simple_qual : simple_quals) {
     const auto comp_expr =
         std::dynamic_pointer_cast<const Analyzer::BinOper>(simple_qual);
@@ -3077,6 +2797,13 @@ std::pair<bool, int64_t> Executor::skipFragment(
       return {false, -1};
     }
     if (!lhs->get_type_info().is_integer() && !lhs->get_type_info().is_time()) {
+      continue;
+    }
+    if (lhs->get_type_info().get_type() == kTIMESTAMP &&
+        (lhs_col->get_type_info() != rhs_const->get_type_info())) {
+      // Original lhs col has different precision so
+      // column metadata holds value in original dimension scale
+      // therefore skip meta value comparison check
       continue;
     }
     const int col_id = lhs_col->get_column_id();
@@ -3138,7 +2865,7 @@ std::pair<bool, int64_t> Executor::skipFragment(
 
 /*
  *   The skipFragmentInnerJoins process all quals stored in the execution unit's
- * inner_joins and gather all the ones that meet the "simple_qual" characteristics
+ * join_quals and gather all the ones that meet the "simple_qual" characteristics
  * (logical expressions with AND operations, etc.). It then uses the skipFragment function
  * to decide whether the fragment should be skipped or not. The fragment will be skipped
  * if at least one of these skipFragment calls return a true statment in its first value.
@@ -3167,7 +2894,7 @@ std::pair<bool, int64_t> Executor::skipFragmentInnerJoins(
     const std::vector<uint64_t>& frag_offsets,
     const size_t frag_idx) {
   std::pair<bool, int64_t> skip_frag{false, -1};
-  for (auto& inner_join : ra_exe_unit.inner_joins) {
+  for (auto& inner_join : ra_exe_unit.join_quals) {
     if (inner_join.type != JoinType::INNER) {
       continue;
     }

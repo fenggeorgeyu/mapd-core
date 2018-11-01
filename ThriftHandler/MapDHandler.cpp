@@ -62,6 +62,7 @@
 #include "Shared/MapDParameters.h"
 #include "Shared/SQLTypeUtilities.h"
 #include "Shared/StringTransform.h"
+#include "Shared/geo_types.h"
 #include "Shared/geosupport.h"
 #include "Shared/import_helpers.h"
 #include "Shared/mapd_shared_mutex.h"
@@ -183,11 +184,8 @@ MapDHandler::MapDHandler(const std::vector<LeafHostInfo>& db_leaves,
 
   std::string calcite_session_prefix = "calcite-" + generate_random_string(64);
 
-  calcite_ = std::make_shared<Calcite>(mapd_parameters.mapd_server_port,
-                                       mapd_parameters.calcite_port,
-                                       base_data_path_,
-                                       mapd_parameters_.calcite_max_mem,
-                                       calcite_session_prefix);
+  calcite_ =
+      std::make_shared<Calcite>(mapd_parameters, base_data_path_, calcite_session_prefix);
 
   ExtensionFunctionsWhitelist::add(calcite_->getExtensionFunctionWhitelist());
 
@@ -499,7 +497,7 @@ void MapDHandler::value_to_thrift_column(const TargetValue& tv,
       if (s) {
         column.data.str_col.push_back(*s);
       } else {
-        column.data.str_col.push_back("");  // null string
+        column.data.str_col.emplace_back("");  // null string
         auto null_p = boost::get<void*>(s_n);
         CHECK(null_p && !*null_p);
       }
@@ -572,7 +570,7 @@ void MapDHandler::value_to_thrift_column(const TargetValue& tv,
       if (s) {
         column.data.str_col.push_back(*s);
       } else {
-        column.data.str_col.push_back("");  // null string
+        column.data.str_col.emplace_back("");  // null string
         auto null_p = boost::get<void*>(s_n);
         CHECK(null_p && !*null_p);
       }
@@ -1102,7 +1100,7 @@ void MapDHandler::get_roles(std::vector<std::string>& roles, const TSessionId& s
         SysCatalog::instance().getRoles(session_info.get_catalog().get_currentDB().dbId);
   } else {
     roles = SysCatalog::instance().getRoles(
-        false, true, session_info.get_currentUser().userId);
+        false, true, session_info.get_currentUser().userName);
   }
 }
 
@@ -1157,27 +1155,156 @@ static TDBObject serialize_db_object(const std::string& roleName,
   return outObject;
 }
 
+bool MapDHandler::has_database_permission(const AccessPrivileges& privs,
+                                          const TDBObjectPermissions& permissions) {
+  if (!permissions.__isset.database_permissions_) {
+    THROW_MAPD_EXCEPTION("Database permissions not set for check.")
+  }
+  auto perms = permissions.database_permissions_;
+  if ((perms.create_ && !privs.hasPermission(DatabasePrivileges::CREATE_DATABASE)) ||
+      (perms.delete_ && !privs.hasPermission(DatabasePrivileges::DROP_DATABASE)) ||
+      (perms.view_sql_editor_ &&
+       !privs.hasPermission(DatabasePrivileges::VIEW_SQL_EDITOR)) ||
+      (perms.access_ && !privs.hasPermission(DatabasePrivileges::ACCESS))) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+bool MapDHandler::has_table_permission(const AccessPrivileges& privs,
+                                       const TDBObjectPermissions& permissions) {
+  if (!permissions.__isset.table_permissions_) {
+    THROW_MAPD_EXCEPTION("Table permissions not set for check.")
+  }
+  auto perms = permissions.table_permissions_;
+  if ((perms.create_ && !privs.hasPermission(TablePrivileges::CREATE_TABLE)) ||
+      (perms.drop_ && !privs.hasPermission(TablePrivileges::DROP_TABLE)) ||
+      (perms.select_ && !privs.hasPermission(TablePrivileges::SELECT_FROM_TABLE)) ||
+      (perms.insert_ && !privs.hasPermission(TablePrivileges::INSERT_INTO_TABLE)) ||
+      (perms.update_ && !privs.hasPermission(TablePrivileges::UPDATE_IN_TABLE)) ||
+      (perms.delete_ && !privs.hasPermission(TablePrivileges::DELETE_FROM_TABLE)) ||
+      (perms.truncate_ && !privs.hasPermission(TablePrivileges::TRUNCATE_TABLE))) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+bool MapDHandler::has_dashboard_permission(const AccessPrivileges& privs,
+                                           const TDBObjectPermissions& permissions) {
+  if (!permissions.__isset.dashboard_permissions_) {
+    THROW_MAPD_EXCEPTION("Dashboard permissions not set for check.")
+  }
+  auto perms = permissions.dashboard_permissions_;
+  if ((perms.create_ && !privs.hasPermission(DashboardPrivileges::CREATE_DASHBOARD)) ||
+      (perms.delete_ && !privs.hasPermission(DashboardPrivileges::DELETE_DASHBOARD)) ||
+      (perms.view_ && !privs.hasPermission(DashboardPrivileges::VIEW_DASHBOARD)) ||
+      (perms.edit_ && !privs.hasPermission(DashboardPrivileges::EDIT_DASHBOARD))) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+bool MapDHandler::has_view_permission(const AccessPrivileges& privs,
+                                      const TDBObjectPermissions& permissions) {
+  if (!permissions.__isset.view_permissions_) {
+    THROW_MAPD_EXCEPTION("View permissions not set for check.")
+  }
+  auto perms = permissions.view_permissions_;
+  if ((perms.create_ && !privs.hasPermission(ViewPrivileges::CREATE_VIEW)) ||
+      (perms.drop_ && !privs.hasPermission(ViewPrivileges::DROP_VIEW)) ||
+      (perms.select_ && !privs.hasPermission(ViewPrivileges::SELECT_FROM_VIEW)) ||
+      (perms.insert_ && !privs.hasPermission(ViewPrivileges::INSERT_INTO_VIEW)) ||
+      (perms.update_ && !privs.hasPermission(ViewPrivileges::UPDATE_IN_VIEW)) ||
+      (perms.delete_ && !privs.hasPermission(ViewPrivileges::DELETE_FROM_VIEW))) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+bool MapDHandler::has_object_privilege(const TSessionId& sessionId,
+                                       const std::string& granteeName,
+                                       const std::string& objectName,
+                                       const TDBObjectType::type objectType,
+                                       const TDBObjectPermissions& permissions) {
+  auto session = get_session(sessionId);
+  auto& cat = session.get_catalog();
+  auto current_user = session.get_currentUser();
+  if (!SysCatalog::instance().arePrivilegesOn()) {
+    return true;
+  } else if (!current_user.isSuper && !current_user.isReallySuper &&
+             !SysCatalog::instance().isRoleGrantedToGrantee(
+                 current_user.userName, granteeName, false)) {
+    THROW_MAPD_EXCEPTION(
+        "Users except superusers can only check privileges for self or roles granted to "
+        "them.")
+  }
+  Catalog_Namespace::UserMetadata user_meta;
+  if (SysCatalog::instance().getMetadataForUser(granteeName, user_meta) &&
+      (user_meta.isSuper || user_meta.isReallySuper)) {
+    return true;
+  }
+  Grantee* grnt = SysCatalog::instance().getGrantee(granteeName);
+  if (!grnt) {
+    THROW_MAPD_EXCEPTION("User or Role " + granteeName + " does not exist.")
+  }
+  DBObjectType type;
+  std::string func_name;
+  switch (objectType) {
+    case TDBObjectType::DatabaseDBObjectType:
+      type = DBObjectType::DatabaseDBObjectType;
+      func_name = "database";
+      break;
+    case TDBObjectType::TableDBObjectType:
+      type = DBObjectType::TableDBObjectType;
+      func_name = "table";
+      break;
+    case TDBObjectType::DashboardDBObjectType:
+      type = DBObjectType::DashboardDBObjectType;
+      func_name = "dashboard";
+      break;
+    case TDBObjectType::ViewDBObjectType:
+      type = DBObjectType::ViewDBObjectType;
+      func_name = "view";
+      break;
+    default:
+      THROW_MAPD_EXCEPTION("Invalid object type (" + std::to_string(objectType) + ").");
+  }
+  DBObject req_object(objectName, type);
+  req_object.loadKey(cat);
+
+  auto grantee_object = grnt->findDbObject(req_object.getObjectKey(), false);
+  if (grantee_object) {
+    // if grantee has privs on the object
+    return permissionFuncMap_[func_name](grantee_object->getPrivileges(), permissions);
+  } else {
+    // no privileges on that object
+    return false;
+  }
+}
+
 void MapDHandler::get_db_objects_for_grantee(std::vector<TDBObject>& TDBObjectsForRole,
                                              const TSessionId& sessionId,
                                              const std::string& roleName) {
   auto session = get_session(sessionId);
   auto user = session.get_currentUser();
   if (!user.isSuper &&
-      !SysCatalog::instance().isRoleGrantedToUser(user.userId, roleName)) {
+      !SysCatalog::instance().isRoleGrantedToGrantee(user.userName, roleName, false)) {
     return;
   }
-  Role* rl = SysCatalog::instance().getMetadataForRole(roleName);
+  auto* rl = SysCatalog::instance().getGrantee(roleName);
   if (rl) {
     auto dbId = session.get_catalog().get_currentDB().dbId;
-    for (auto dbObjectIt = rl->getDbObject()->begin();
-         dbObjectIt != rl->getDbObject()->end();
-         ++dbObjectIt) {
-      if (dbObjectIt->first.dbId != dbId) {
+    for (auto& dbObject : *rl->getDbObjects(true)) {
+      if (dbObject.first.dbId != dbId) {
         // TODO (max): it doesn't scale well in case we have many DBs (not a typical
         // usecase for now, though)
         continue;
       }
-      TDBObject tdbObject = serialize_db_object(roleName, *dbObjectIt->second);
+      TDBObject tdbObject = serialize_db_object(roleName, *dbObject.second);
       TDBObjectsForRole.push_back(tdbObject);
     }
   } else {
@@ -1245,37 +1372,51 @@ void MapDHandler::get_db_object_privs(std::vector<TDBObject>& TDBObjects,
     TDBObjects.push_back(serialize_db_object(session.get_currentUser().userName, dbObj));
   };
 
-  std::vector<std::string> roles = SysCatalog::instance().getRoles(
-      true, session.get_currentUser().isSuper, session.get_currentUser().userId);
-  for (const auto& role : roles) {
+  std::vector<std::string> grantees = SysCatalog::instance().getRoles(
+      true, session.get_currentUser().isSuper, session.get_currentUser().userName);
+  for (const auto& grantee : grantees) {
     DBObject* object_found;
-    Role* rl = SysCatalog::instance().getMetadataForRole(role);
-    if (rl && (object_found = rl->findDbObject(object_to_find.getObjectKey()))) {
-      TDBObjects.push_back(serialize_db_object(role, *object_found));
+    auto* gr = SysCatalog::instance().getGrantee(grantee);
+    if (gr && (object_found = gr->findDbObject(object_to_find.getObjectKey(), true))) {
+      TDBObjects.push_back(serialize_db_object(grantee, *object_found));
     }
     // check object permissions on Database level
-    if (rl && (object_found = rl->findDbObject(object_to_find_dblevel.getObjectKey()))) {
-      TDBObjects.push_back(serialize_db_object(role, *object_found));
+    if (gr &&
+        (object_found = gr->findDbObject(object_to_find_dblevel.getObjectKey(), true))) {
+      TDBObjects.push_back(serialize_db_object(grantee, *object_found));
     }
   }
 }
 
 void MapDHandler::get_all_roles_for_user(std::vector<std::string>& roles,
                                          const TSessionId& sessionId,
-                                         const std::string& userName) {
+                                         const std::string& granteeName) {
   auto session = get_session(sessionId);
-  Catalog_Namespace::UserMetadata user_meta;
-  if (SysCatalog::instance().getMetadataForUser(userName, user_meta)) {
-    if (session.get_currentUser().isSuper ||
-        session.get_currentUser().userId == user_meta.userId) {
-      roles = SysCatalog::instance().getUserRoles(user_meta.userId);
+  auto* grantee = SysCatalog::instance().getGrantee(granteeName);
+  if (grantee) {
+    if (session.get_currentUser().isSuper) {
+      roles = grantee->getRoles();
+    } else if (grantee->isUser()) {
+      if (session.get_currentUser().userName == granteeName) {
+        roles = grantee->getRoles();
+      } else {
+        THROW_MAPD_EXCEPTION(
+            "Only a superuser is authorized to request list of roles granted to another "
+            "user.");
+      }
     } else {
-      THROW_MAPD_EXCEPTION(
-          "Only a superuser is authorized to request list of roles granted to another "
-          "user.");
+      CHECK(!grantee->isUser());
+      // granteeName is actually a roleName here and we can check a role
+      // only if it is granted to us
+      if (SysCatalog::instance().isRoleGrantedToGrantee(
+              session.get_currentUser().userName, granteeName, false)) {
+        roles = grantee->getRoles();
+      } else {
+        THROW_MAPD_EXCEPTION("A user can check only roles granted to him.");
+      }
     }
   } else {
-    THROW_MAPD_EXCEPTION("User " + userName + " does not exist.");
+    THROW_MAPD_EXCEPTION("Grantee " + granteeName + " does not exist.");
   }
 }
 
@@ -2066,30 +2207,74 @@ void MapDHandler::load_table(const TSessionId& session,
   } else {
     loader.reset(new Importer_NS::Loader(cat, td));
   }
-  Importer_NS::CopyParams copy_params;
+  auto col_descs = loader->get_column_descs();
+  auto geo_physical_cols = std::count_if(
+      col_descs.begin(), col_descs.end(), [](auto cd) { return cd->isGeoPhyCol; });
   // TODO(andrew): nColumns should be number of non-virtual/non-system columns.
   //               Subtracting 1 (rowid) until TableDescriptor is updated.
-  if (rows.front().cols.size() !=
-      static_cast<size_t>(td->nColumns) - (td->hasDeletedCol ? 2 : 1)) {
+  if (rows.front().cols.size() != static_cast<size_t>(td->nColumns) - geo_physical_cols -
+                                      (td->hasDeletedCol ? 2 : 1)) {
     THROW_MAPD_EXCEPTION("Wrong number of columns to load into Table " + table_name +
                          " (" + std::to_string(rows.front().cols.size()) + " vs " +
-                         std::to_string(td->nColumns - 1) + ")");
+                         std::to_string(td->nColumns - geo_physical_cols - 1) + ")");
   }
-  auto col_descs = loader->get_column_descs();
   std::vector<std::unique_ptr<Importer_NS::TypedImportBuffer>> import_buffers;
   for (auto cd : col_descs) {
     import_buffers.push_back(std::unique_ptr<Importer_NS::TypedImportBuffer>(
         new Importer_NS::TypedImportBuffer(cd, loader->get_string_dict(cd))));
   }
+  Importer_NS::CopyParams copy_params;
   size_t rows_completed = 0;
-  size_t col_idx = 0;
   for (auto const& row : rows) {
+    size_t import_idx = 0;  // index into the TStringRow being loaded
+    size_t col_idx = 0;     // index into column description vector
     try {
-      col_idx = 0;
+      size_t skip_physical_cols = 0;
       for (auto cd : col_descs) {
+        if (skip_physical_cols > 0) {
+          if (!cd->isGeoPhyCol) {
+            throw std::runtime_error("Unexpected physical column");
+          }
+          skip_physical_cols--;
+          continue;
+        }
         import_buffers[col_idx]->add_value(
-            cd, row.cols[col_idx].str_val, row.cols[col_idx].is_null, copy_params);
+            cd, row.cols[import_idx].str_val, row.cols[import_idx].is_null, copy_params);
+        // Advance to the next column within the table
         col_idx++;
+
+        if (cd->columnType.is_geometry()) {
+          // Populate physical columns
+          std::vector<double> coords, bounds;
+          std::vector<int> ring_sizes, poly_rings;
+          int render_group = 0;
+          SQLTypeInfo ti;
+          if (row.cols[import_idx].is_null ||
+              !Geo_namespace::GeoTypesFactory::getGeoColumns(row.cols[import_idx].str_val,
+                                                             ti,
+                                                             coords,
+                                                             bounds,
+                                                             ring_sizes,
+                                                             poly_rings,
+                                                             false)) {
+            throw std::runtime_error("Invalid geometry");
+          }
+          if (cd->columnType.get_type() != ti.get_type()) {
+            throw std::runtime_error("Geometry type mismatch");
+          }
+          Importer_NS::Importer::set_geo_physical_import_buffer(cat,
+                                                                cd,
+                                                                import_buffers,
+                                                                col_idx,
+                                                                coords,
+                                                                bounds,
+                                                                ring_sizes,
+                                                                poly_rings,
+                                                                render_group);
+          skip_physical_cols = cd->columnType.get_physical_cols();
+        }
+        // Advance to the next field within the row
+        import_idx++;
       }
       rows_completed++;
     } catch (const std::exception& e) {
@@ -2507,7 +2692,7 @@ void MapDHandler::detect_column_types(TDetectResult& _return,
       }
     } else if (copy_params.table_type == Importer_NS::TableType::POLYGON) {
       // @TODO simon.eves get this from somewhere!
-      const std::string geoColumnName(MAPD_GEO_PREFIX);
+      const std::string geoColumnName(OMNISCI_GEO_PREFIX);
 
       check_geospatial_files(file_path, copy_params);
       std::list<ColumnDescriptor> cds = Importer_NS::Importer::gdalToColumnDescriptors(
@@ -2807,8 +2992,7 @@ std::vector<std::string> MapDHandler::get_valid_groups(const TSessionId& session
   Catalog_Namespace::UserMetadata user_meta;
   for (auto& group : groups) {
     user_meta.isSuper = false;  // initialize default flag
-    if (!SysCatalog::instance().getMetadataForUser(group, user_meta) &&
-        !SysCatalog::instance().getMetadataForRole(group)) {
+    if (!SysCatalog::instance().getGrantee(group)) {
       THROW_MAPD_EXCEPTION("Exception: User/Role " + group + " does not exist");
     } else if (!user_meta.isSuper) {
       valid_groups.push_back(group);
@@ -2856,13 +3040,7 @@ void MapDHandler::share_dashboard(const TSessionId& session,
 
     object.setPrivileges(privs);
   }
-  for (auto role : valid_groups) {
-    try {
-      SysCatalog::instance().grantDBObjectPrivileges(role, object, cat);
-    } catch (const std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
-    }
-  }
+  SysCatalog::instance().grantDBObjectPrivilegesBatch(valid_groups, {object}, cat);
 }
 
 void MapDHandler::unshare_dashboard(const TSessionId& session,
@@ -2903,13 +3081,7 @@ void MapDHandler::unshare_dashboard(const TSessionId& session,
 
     object.setPrivileges(privs);
   }
-  for (auto role : valid_groups) {
-    try {
-      SysCatalog::instance().revokeDBObjectPrivileges(role, object, cat);
-    } catch (const std::exception& e) {
-      THROW_MAPD_EXCEPTION(std::string("Exception: ") + e.what());
-    }
-  }
+  SysCatalog::instance().revokeDBObjectPrivilegesBatch(valid_groups, {object}, cat);
 }
 
 void MapDHandler::get_dashboard_grantees(
@@ -3295,8 +3467,13 @@ void MapDHandler::import_geo_table(const TSessionId& session,
       TColumnType cd_col_type = populateThriftColumnType(&cat, cd);
       if (rd[rd_index].col_name != cd->columnName ||
           rd[rd_index].col_type != cd_col_type.col_type) {
-        structure_matches = false;
-        break;
+        if (cd->columnName == "mapd_geo" && rd[rd_index].col_name == OMNISCI_GEO_PREFIX) {
+          // Support legacy geo column names
+          rd[rd_index].col_name = cd->columnName;
+        } else {
+          structure_matches = false;
+          break;
+        }
       }
       rd_index++;
     }
@@ -3326,14 +3503,20 @@ void MapDHandler::import_geo_table(const TSessionId& session,
         r.col_type.type == TDatumType::LINESTRING ||
         r.col_type.type == TDatumType::POLYGON ||
         r.col_type.type == TDatumType::MULTIPOLYGON) {
-      if (r.col_name == MAPD_GEO_PREFIX) {
+      // TODO(team): allow user to override the geo column name
+      if (r.col_name == OMNISCI_GEO_PREFIX) {
+        have_geo_column_with_correct_name = true;
+      } else if (r.col_name == "mapd_geo") {
+        CHECK(colname_to_src.find(r.col_name) != colname_to_src.end());
+        // Normalize column names for geo append with legacy column naming scheme
+        colname_to_src[r.col_name] = r.col_name;
         have_geo_column_with_correct_name = true;
       }
     }
   }
   if (!have_geo_column_with_correct_name) {
     THROW_MAPD_EXCEPTION("Table " + table_name +
-                         " does not have a geo column with name '" + MAPD_GEO_PREFIX +
+                         " does not have a geo column with name '" + OMNISCI_GEO_PREFIX +
                          "'. Import aborted!");
   }
 
@@ -3579,7 +3762,7 @@ std::vector<PushedDownFilterInfo> MapDHandler::execute_rel_alg(
   const auto& cat = session_info.get_catalog();
   CompilationOptions co = {
       executor_device_type, true, ExecutorOptLevel::Default, g_enable_dynamic_watchdog};
-  ExecutionOptions eo = {false,
+  ExecutionOptions eo = {g_enable_columnar_output,
                          allow_multifrag_,
                          just_explain,
                          allow_loop_joins_ || just_validate,
@@ -3652,8 +3835,11 @@ void MapDHandler::execute_rel_alg_df(TDataFrame& _return,
   RelAlgExecutor ra_executor(executor.get(), cat);
   const auto result = ra_executor.executeRelAlgQuery(query_ra, co, eo, nullptr);
   const auto rs = result.getRows();
-  const auto copy = rs->getArrowCopy(
-      data_mgr_.get(), device_type, device_id, getTargetNames(result.getTargetsMeta()));
+  const auto copy = rs->getArrowCopy(data_mgr_.get(),
+                                     device_type,
+                                     device_id,
+                                     getTargetNames(result.getTargetsMeta()),
+                                     first_n);
   _return.sm_handle = std::string(copy.sm_handle.begin(), copy.sm_handle.end());
   _return.sm_size = copy.sm_size;
   _return.df_handle = std::string(copy.df_handle.begin(), copy.df_handle.end());

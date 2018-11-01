@@ -315,16 +315,24 @@ TEST_F(ImportTest, One_csv_file) {
   EXPECT_TRUE(import_test_local("trip_data_9.csv", 100, 1.0));
 }
 
+TEST_F(ImportTest, One_csv_file_no_newline) {
+  EXPECT_TRUE(import_test_local("trip_data_no_newline_1.csv", 100, 1.0));
+}
+
+TEST_F(ImportTest, Many_csv_file) {
+  EXPECT_TRUE(import_test_local("trip_data_*.csv", 1200, 1.0));
+}
+
+TEST_F(ImportTest, Many_csv_file_no_newline) {
+  EXPECT_TRUE(import_test_local("trip_data_no_newline_*.csv", 200, 1.0));
+}
+
 TEST_F(ImportTest, One_gz_file) {
   EXPECT_TRUE(import_test_local("trip_data_9.gz", 100, 1.0));
 }
 
 TEST_F(ImportTest, One_bz2_file) {
   EXPECT_TRUE(import_test_local("trip_data_9.bz2", 100, 1.0));
-}
-
-TEST_F(ImportTest, Many_csv_file) {
-  EXPECT_TRUE(import_test_local("trip_data_*.csv", 1000, 1.0));
 }
 
 TEST_F(ImportTest, One_tar_with_many_csv_files) {
@@ -345,6 +353,10 @@ TEST_F(ImportTest, One_zip_with_many_csv_files) {
 
 TEST_F(ImportTest, One_7z_with_many_csv_files) {
   EXPECT_TRUE(import_test_local("trip_data.7z", 1000, 1.0));
+}
+
+TEST_F(ImportTest, One_tgz_with_many_csv_files_no_newline) {
+  EXPECT_TRUE(import_test_local("trip_data_some_with_no_newline.tgz", 500, 1.0));
 }
 
 // Sharding tests
@@ -429,7 +441,7 @@ void check_geo_import() {
 }
 
 void check_geo_gdal_point_import() {
-  auto rows = run_query("SELECT mapd_geo, trip FROM geospatial WHERE trip = 1.0");
+  auto rows = run_query("SELECT omnisci_geo, trip FROM geospatial WHERE trip = 1.0");
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(2), crt_row.size());
   const auto point = boost::get<std::string>(v<NullableString>(crt_row[0]));
@@ -439,7 +451,7 @@ void check_geo_gdal_point_import() {
 }
 
 void check_geo_gdal_mpoly_import() {
-  auto rows = run_query("SELECT mapd_geo, trip FROM geospatial WHERE trip = 1.0");
+  auto rows = run_query("SELECT omnisci_geo, trip FROM geospatial WHERE trip = 1.0");
   auto crt_row = rows->getNextRow(true, true);
   CHECK_EQ(size_t(2), crt_row.size());
   const auto mpoly = boost::get<std::string>(v<NullableString>(crt_row[0]));
@@ -456,7 +468,7 @@ void check_geo_num_rows(const std::string& project_columns,
 }
 
 void check_geo_gdal_point_tv_import() {
-  auto rows = run_query("SELECT mapd_geo, trip FROM geospatial WHERE trip = 1.0");
+  auto rows = run_query("SELECT omnisci_geo, trip FROM geospatial WHERE trip = 1.0");
   rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
   auto crt_row = rows->getNextRow(true, true);
   compare_geo_target(crt_row[0], GeoPointTargetValue({1.0, 1.0}), 1e-7);
@@ -465,7 +477,7 @@ void check_geo_gdal_point_tv_import() {
 }
 
 void check_geo_gdal_mpoly_tv_import() {
-  auto rows = run_query("SELECT mapd_geo, trip FROM geospatial WHERE trip = 1.0");
+  auto rows = run_query("SELECT omnisci_geo, trip FROM geospatial WHERE trip = 1.0");
   rows->setGeoReturnType(ResultSet::GeoReturnType::GeoTargetValue);
   auto crt_row = rows->getNextRow(true, true);
   compare_geo_target(crt_row[0],
@@ -505,6 +517,15 @@ TEST_F(GeoImportTest, CSV_Import_Empties) {
   check_geo_import();
   check_geo_num_rows("p1, l, poly, mpoly, p2, p3, p4, trip_distance",
                      6);  // we expect it to drop the 4 rows containing 'EMPTY'
+}
+
+TEST_F(GeoImportTest, CSV_Import_Degenerate) {
+  const auto file_path =
+      boost::filesystem::path("../../Tests/Import/datafiles/geospatial_degenerate.csv");
+  run_ddl_statement("COPY geospatial FROM '" + file_path.string() + "';");
+  check_geo_import();
+  check_geo_num_rows("p1, l, poly, mpoly, p2, p3, p4, trip_distance",
+                     6);  // we expect it to drop the 4 rows containing degenerate polys
 }
 
 // the remaining tests in this group are incomplete but leave them as placeholders
@@ -580,7 +601,7 @@ TEST_F(GeoGDALImportTest, Geojson_MultiPolygon_Import) {
       boost::filesystem::path("geospatial_mpoly/geospatial_mpoly.geojson");
   import_test_geofile_importer(file_path.string(), "geospatial", false);
   check_geo_gdal_mpoly_import();
-  check_geo_num_rows("mapd_geo, trip", 10);
+  check_geo_num_rows("omnisci_geo, trip", 10);
 }
 
 TEST_F(GeoGDALImportTest, Geojson_MultiPolygon_Import_Empties) {
@@ -588,7 +609,15 @@ TEST_F(GeoGDALImportTest, Geojson_MultiPolygon_Import_Empties) {
       boost::filesystem::path("geospatial_mpoly/geospatial_mpoly_empties.geojson");
   import_test_geofile_importer(file_path.string(), "geospatial", false);
   check_geo_gdal_mpoly_import();
-  check_geo_num_rows("mapd_geo, trip", 8);  // we expect it to drop 2 of the 10 rows
+  check_geo_num_rows("omnisci_geo, trip", 8);  // we expect it to drop 2 of the 10 rows
+}
+
+TEST_F(GeoGDALImportTest, Geojson_MultiPolygon_Import_Degenerate) {
+  const auto file_path =
+      boost::filesystem::path("geospatial_mpoly/geospatial_mpoly_degenerate.geojson");
+  import_test_geofile_importer(file_path.string(), "geospatial", false);
+  check_geo_gdal_mpoly_import();
+  check_geo_num_rows("omnisci_geo, trip", 8);  // we expect it to drop 2 of the 10 rows
 }
 
 TEST_F(GeoGDALImportTest, Shapefile_Point_Import) {
@@ -633,10 +662,10 @@ TEST_F(GeoGDALImportTest, Geojson_MultiPolygon_Append) {
   const auto file_path =
       boost::filesystem::path("geospatial_mpoly/geospatial_mpoly.geojson");
   import_test_geofile_importer(file_path.string(), "geospatial", false);
-  check_geo_num_rows("mapd_geo, trip", 10);
+  check_geo_num_rows("omnisci_geo, trip", 10);
   ASSERT_NO_THROW(
       import_test_geofile_importer(file_path.string(), "geospatial", false, false));
-  check_geo_num_rows("mapd_geo, trip", 20);
+  check_geo_num_rows("omnisci_geo, trip", 20);
 }
 
 #ifdef HAVE_AWS_S3
